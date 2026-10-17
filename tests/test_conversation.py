@@ -1,6 +1,7 @@
 """Conversation engine against the fake telephony backend, fake TTS/STT and a scripted detector."""
 
 import time
+import wave
 from pathlib import Path
 
 import pytest
@@ -58,10 +59,11 @@ class FakeDetector:
         self.buf = bytearray()
         self.in_speech = False
         self.silent = 0
+        self.last_voiced = False
 
     def feed(self, frame):
         assert len(frame) == FRAME_BYTES
-        loud = any(frame)
+        loud = self.last_voiced = any(frame)
         if loud:
             self.silent = 0
             self.buf += frame
@@ -136,14 +138,65 @@ def test_answer_then_reply(make, cfg):
     assert mgr.active()["turns"] == 1
 
 
-def test_barge_in_stops_playback(make):
-    mgr, tel, _ = make("wait stop", incoming=[1.0, speech(0.6), 2.0])
+def test_barge_in_stops_playback(make, cfg):
+    cfg.conversation.first_turn_grace_s = 0.4
+    mgr, tel, stt = make("wait stop", incoming=[1.0, speech(0.9), 2.0])
     r = mgr.start(LONG)
     assert r.status is Status.IN_CALL and r.user_said == "wait stop"
     call = tel.last_call
     assert call.stop_count >= 1
     assert len(call.played) < call.queued_bytes
-    assert len(call.played) < tts_bytes(LONG) // 2
+    assert len(call.played) < tts_bytes(LONG) * 3 // 4
+    assert stt.heard[0] >= len(speech(0.9))        # the interrupting speech is kept for STT
+
+
+def test_no_barge_in_from_hello_during_first_turn_grace(make):
+    mgr, tel, stt = make("second try", incoming=[0.5, speech(0.4), 3.2, speech(0.5), 2.0])
+    r = mgr.start(LONG)
+    assert r.status is Status.IN_CALL and r.user_said == "second try"
+    call = tel.last_call
+    assert call.stop_count == 0
+    assert len(call.played) == call.queued_bytes
+    assert len(stt.heard) == 1
+
+
+def test_no_barge_in_from_short_noise_bursts(make, cfg):
+    cfg.conversation.first_turn_grace_s = 0.4
+    burst = speech(0.2)
+    mgr, tel, _ = make("later", incoming=[1.0, burst, 0.5, burst, 0.5, burst, 1.0, speech(0.5), 2.0])
+    r = mgr.start(LONG)
+    assert r.status is Status.IN_CALL and r.user_said == "later"
+    assert tel.last_call.stop_count == 0
+    assert len(tel.last_call.played) == tel.last_call.queued_bytes
+
+
+def test_barge_in_disabled(make, cfg):
+    cfg.conversation.barge_in = False
+    cfg.conversation.first_turn_grace_s = 0.4
+    mgr, tel, stt = make("second try", incoming=[1.0, speech(1.2), 2.4, speech(0.5), 2.0])
+    r = mgr.start(LONG)
+    assert r.status is Status.IN_CALL and r.user_said == "second try"
+    assert tel.last_call.stop_count == 0
+    assert len(tel.last_call.played) == tel.last_call.queued_bytes
+    assert len(stt.heard) == 1
+
+
+def test_debug_audio_writes_wav(make, cfg, tmp_path):
+    cfg.conversation.debug_audio = True
+    mgr, _, _ = make("hi", incoming=[0.5, speech(0.4)])
+    r = mgr.start(SHORT)
+    assert mgr.end(r.call_id).status is Status.ENDED
+    path = tmp_path / "logs" / "audio" / f"{r.call_id}-in.wav"
+    with wave.open(str(path)) as w:
+        assert (w.getnchannels(), w.getsampwidth(), w.getframerate()) == (1, 2, SAMPLE_RATE)
+        assert w.getnframes() >= SAMPLE_RATE // 2
+
+
+def test_no_debug_audio_by_default(make, tmp_path):
+    mgr, _, _ = make("hi", incoming=[0.5, speech(0.4)])
+    r = mgr.start(SHORT)
+    mgr.end(r.call_id)
+    assert not (tmp_path / "logs" / "audio").exists()
 
 
 def test_barge_in_skipped_without_full_duplex(make):

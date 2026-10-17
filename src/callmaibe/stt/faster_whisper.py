@@ -1,5 +1,7 @@
 """Local STT via faster-whisper."""
 
+import threading
+
 import numpy as np
 
 from callmaibe import paths
@@ -15,18 +17,20 @@ class FasterWhisperSTT(STT):
     def __init__(self, cfg: STTCfg):
         self.cfg = cfg
         self._model = None
+        self._lock = threading.Lock()   # warmup thread and the first call both load the model
 
     def _load(self):
-        if self._model is None:
-            from faster_whisper import WhisperModel
+        with self._lock:
+            if self._model is None:
+                from faster_whisper import WhisperModel
 
-            self._model = WhisperModel(
-                self.cfg.model,
-                device=self.cfg.device,
-                compute_type=self.cfg.compute_type,
-                download_root=str(paths.models_dir() / "whisper"),
-            )
-        return self._model
+                self._model = WhisperModel(
+                    self.cfg.model,
+                    device=self.cfg.device,
+                    compute_type=self.cfg.compute_type,
+                    download_root=str(paths.models_dir() / "whisper"),
+                )
+            return self._model
 
     def transcribe(self, pcm: bytes) -> str:
         if len(pcm) < _MIN_BYTES:

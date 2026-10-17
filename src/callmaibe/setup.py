@@ -200,10 +200,10 @@ class Ctx:
             return 0, ""
         return self.run(cmd)
 
-    def ask(self, prompt: str, default: str = "") -> str:
+    def ask(self, prompt: str, default: str = "", show_default: bool = True) -> str:
         if not self.interactive:
             return default
-        shown = f" [{default}]" if default else ""
+        shown = (f" [{default}]" if show_default else " [Enter keeps the current one]") if default else ""
         try:
             return input(f"{prompt}{shown}: ").strip() or default
         except EOFError:
@@ -486,7 +486,7 @@ def add_arguments(sp: argparse.ArgumentParser) -> None:
 
 def _ask_uri(ctx: Ctx, prompt: str, default: str, avoid: str = "") -> str:
     while True:
-        raw = ctx.ask(prompt, default)
+        raw = ctx.ask(prompt, default, show_default=False)   # don't echo real addresses on screen
         try:
             uri = normalize_uri(raw)
         except ValueError as e:
@@ -524,10 +524,11 @@ def run(args: argparse.Namespace, path: Path | None = None, runner: Runner | Non
     sip = args.backend != "local"
     if sip:
         print("1. Agent SIP address")
-        agent_uri = agent_uri or (_ask_uri(ctx, "  Agent SIP address (name, name@host or sip:name@host)",
+        agent_uri = agent_uri or (_ask_uri(ctx, "  Agent SIP address, e.g. my-agent or sip:my-agent@sip.linphone.org",
                                            cur("account", "uri")) if ctx.interactive else None)
         print("2. Your SIP address (the phone that rings)")
-        callee_uri = callee_uri or (_ask_uri(ctx, "  Your SIP address", cur("callee", "uri"),
+        callee_uri = callee_uri or (_ask_uri(ctx, "  Your SIP address, e.g. me or sip:me@sip.linphone.org",
+                                             cur("callee", "uri"),
                                              avoid=agent_uri or cur("account", "uri"))
                                     if ctx.interactive else None)
         if (agent_uri or cur("account", "uri")).lower() == (callee_uri or "-").lower():

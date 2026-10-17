@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import threading
 import urllib.request
 from collections.abc import Iterator
 from pathlib import Path
@@ -28,6 +29,10 @@ def clean(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_FIRST_CHUNK_MAX = 60      # a longer first sentence is split at its first natural break
+_FIRST_CHUNK_MIN = 15      # ...but not before this many characters
+
+
 def split_sentences(text: str) -> list[str]:
     out: list[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+", clean(text)):
@@ -42,7 +47,15 @@ def split_sentences(text: str) -> list[str]:
             else:
                 cur = f"{cur} {part}".strip()
         out.append(cur)
-    return [s for s in out if re.search(r"\w", s)]
+    out = [s for s in out if re.search(r"\w", s)]
+    if out and len(out[0]) > _FIRST_CHUNK_MAX:       # short first chunk: audio starts sooner
+        m = re.search(r"[,;:]\s|\s[-–—]+\s", out[0][_FIRST_CHUNK_MIN:])
+        if m:
+            cut = _FIRST_CHUNK_MIN + m.start() + (1 if m.group()[0] in ",;:" else 0)
+            head, tail = out[0][:cut].strip(), out[0][cut:].strip(" -–—")
+            if re.search(r"\w", tail):
+                out[0:1] = [head, tail]
+    return out
 
 
 def _fetch(name: str, dest: Path) -> Path:
@@ -50,7 +63,7 @@ def _fetch(name: str, dest: Path) -> Path:
     if path.exists():
         return path
     log.info("downloading %s", name)
-    part = path.with_name(name + ".part")
+    part = path.with_name(f"{name}.{os.getpid()}.part")   # unique, in case two processes download
     urllib.request.urlretrieve(_BASE_URL + name, part)
     os.replace(part, path)
     return path
@@ -60,8 +73,13 @@ class KokoroTTS(TTS):
     def __init__(self, cfg: TTSCfg):
         self.cfg = cfg
         self._model = None
+        self._lock = threading.Lock()   # warmup thread and the first call both load the model
 
     def _load(self):
+        with self._lock:
+            return self._load_locked()
+
+    def _load_locked(self):
         if self._model is None:
             from kokoro_onnx import Kokoro
 

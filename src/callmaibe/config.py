@@ -59,7 +59,7 @@ class TTSCfg:
 @dataclass
 class STTCfg:
     engine: str = "faster-whisper"
-    model: str = "small"
+    model: str = "base.en"                          # non-English needs a multilingual model: "base" or "small"
     language: str = "en"
     device: str = "auto"                            # auto | cpu | cuda
     compute_type: str = "int8"
@@ -69,12 +69,17 @@ class STTCfg:
 class ConversationCfg:
     ring_timeout_s: float = 45
     listen_timeout_s: float = 20                    # no speech at all -> status no_reply
-    end_silence_ms: int = 1200                      # silence that ends your turn
+    end_silence_ms: int = 900                       # silence that ends your turn
     max_turn_s: float = 60
     idle_hangup_s: float = 120                      # agent silent this long between turns -> hang up
     max_call_min: float = 20
     thinking_cue: bool = True
     keep_transcripts: bool = True
+    barge_in: bool = True                           # let you interrupt the agent while it speaks
+    barge_in_min_ms: int = 700                      # sustained speech needed to interrupt
+    first_turn_grace_s: float = 2.5                 # no barge-in this long into the opening message
+    vad_aggressiveness: int = 3                     # webrtcvad 0-3; higher rejects more noise
+    debug_audio: bool = False                       # save incoming call audio to <home>/logs/audio/
 
 
 @dataclass

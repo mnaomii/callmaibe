@@ -71,6 +71,28 @@ def test_reset(monkeypatch):
     assert TurnEvent.SPEECH_START in evs and TurnEvent.TURN_END in evs
 
 
+def _noise(rms: float, frames: int, seed: int) -> list[bytes]:
+    rng = np.random.default_rng(seed)
+    n = FRAME_BYTES // 2
+    return [rng.normal(0, rms, n).astype("<i2").tobytes() for _ in range(frames)]
+
+
+def test_energy_gate_ends_turn_in_steady_noise(monkeypatch):
+    det = TurnDetector(end_silence_ms=400)
+    monkeypatch.setattr(det._vad, "is_speech", lambda frame, rate: True)   # the VAD calls noise speech
+    evs = feed_all(det, _noise(300, 25, 1) + _noise(3000, 30, 2) + _noise(300, 100, 3))
+    assert evs.count(TurnEvent.SPEECH_START) == 1
+    assert evs.count(TurnEvent.TURN_END) == 1
+    assert det.noise_floor_db is not None and det.noise_floor_db < -30
+
+
+def test_energy_gate_ignores_quiet_noise(monkeypatch):
+    det = TurnDetector()
+    monkeypatch.setattr(det._vad, "is_speech", lambda frame, rate: True)
+    assert set(feed_all(det, _noise(100, 100, 4))) == {TurnEvent.NONE}   # below -45 dBFS
+    assert not det.last_voiced
+
+
 def test_resample_roundtrip():
     x = (0.5 * np.sin(2 * np.pi * 440 * np.arange(24000) / 24000)).astype(np.float32)
     pcm = to_internal(x, 24000)
@@ -99,6 +121,15 @@ def test_split_sentences():
     assert "link" in out[1] and "http" not in out[1]
     long = ", ".join(["word " * 8] * 10)
     assert all(len(s) < 260 for s in split_sentences(long)) and len(split_sentences(long)) > 1
+
+
+def test_first_chunk_split_early():
+    out = split_sentences("I looked at the failing test and it turns out the fixture was wrong, so I fixed it. Push it?")
+    assert out == ["I looked at the failing test and it turns out the fixture was wrong,",
+                   "so I fixed it.", "Push it?"]
+    assert split_sentences("Short one, ok. Another sentence, with a comma and more words in it to be long enough.")[0]         == "Short one, ok."
+    nobreak = "word " * 20
+    assert split_sentences(nobreak) == [nobreak.strip()]
 
 
 def test_factories_reject_unknown():

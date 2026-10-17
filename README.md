@@ -257,7 +257,7 @@ variant = "int8"               # kokoro model: int8 (88 MB) | fp32 (310 MB)
 
 [stt]
 engine = "faster-whisper"
-model = "small"                # tiny | base | small | medium ...
+model = "base.en"              # tiny.en | base.en | small.en ...; non-English needs a multilingual model: base | small
 language = "en"
 device = "auto"                # auto | cpu | cuda
 compute_type = "int8"
@@ -265,12 +265,17 @@ compute_type = "int8"
 [conversation]
 ring_timeout_s = 45            # give up if nobody answers
 listen_timeout_s = 20          # no speech at all in a turn -> status no_reply
-end_silence_ms = 1200          # silence that ends your turn
+end_silence_ms = 900           # silence that ends your turn
 max_turn_s = 60
 idle_hangup_s = 120            # agent silent this long between turns -> hang up
 max_call_min = 20
 thinking_cue = true            # soft sound while the agent thinks
 keep_transcripts = true
+barge_in = true                # you can interrupt the agent by talking over it
+barge_in_min_ms = 700          # sustained speech needed to interrupt (short noises are ignored)
+first_turn_grace_s = 2.5       # no interrupting the opening message ("hello?" at pickup)
+vad_aggressiveness = 3         # 0-3; higher rejects more line noise
+debug_audio = false            # save incoming audio to <home>/logs/audio/<call_id>-in.wav
 
 [policy]
 enabled = true                 # global kill switch default; sessions still need /call on
@@ -320,7 +325,7 @@ On Windows with the WSL daemon, both sides use the same Windows folder (the daem
 - No MCP tool accepts a phone number or SIP address. The callee comes from `config.toml` only, so a prompt injection cannot make the agent call someone else.
 - Only you can enable calling. There is no tool that switches it on; `/call` is handled by a hook or a shell step that runs on your input, and the daemon enforces the result.
 - Speech is local by default (Kokoro and faster-whisper). Nothing is sent to a speech cloud unless you configure one.
-- Transcripts are stored locally in `<home>/transcripts/`; turn them off with `keep_transcripts = false`. Audio is not stored.
+- Transcripts are stored locally in `<home>/transcripts/`; turn them off with `keep_transcripts = false`. Audio is not stored, unless you turn on `debug_audio`: that writes everything you say on a call to `<home>/logs/audio/<call_id>-in.wav` so thresholds can be tuned. It contains your voice and background sound, so leave it off normally and delete the files afterwards.
 - The daemon listens on 127.0.0.1 only and needs a random token from a user-only file. Inbound calls are rejected.
 - The SIP password lives in the OS keyring (`callmaibe password set`), or in an environment variable on headless machines. It is never written to the config.
 - Whoever answers your phone can steer the agent. A spoken yes can approve actions, including destructive ones. The skill makes the agent read the exact action back and hear a clear yes first; treat the phone like a keyboard.

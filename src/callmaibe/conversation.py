@@ -24,13 +24,15 @@ import logging
 import threading
 import time
 import uuid
+import wave
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from . import paths
-from .audio import FRAME_MS
+from .audio import FRAME_MS, SAMPLE_RATE
 from .audio.vad import TurnEvent
 from .config import Config
 from .status import Status, TurnResult
@@ -44,7 +46,7 @@ FRAME_S = FRAME_MS / 1000
 GOODBYE_IDLE = "I have to go now. I'll write the rest in the terminal."
 CUE_INTERVAL_S = 4.0
 FIRST_CUE_S = 1.0
-BARGE_GRACE_S = 0.4          # ignore the first moment of our own playback (line echo, "hello?")
+BARGE_GRACE_S = 0.4          # ignore the first moment of our own playback (line echo); later turns
 READ_POLL_S = 0.05
 
 _RING_END = {
@@ -68,10 +70,16 @@ class _Session:
     idle_stop: threading.Event = field(default_factory=threading.Event)
     producer: threading.Thread | None = None
     done: bool = False
+    wav: wave.Wave_write | None = None
 
     def note(self, who: str, text: str) -> None:
         if text:
             self.lines.append((datetime.now(), who, text))
+
+
+def _db(det) -> str:
+    v = getattr(det, "noise_floor_db", None)
+    return "n/a" if v is None else f"{v:.1f} dBFS"
 
 
 class _CallEnded(Exception):
@@ -209,6 +217,12 @@ class CallManager:
 
     def _finish(self, sess: _Session, result: TurnResult, transcript: bool = True) -> TurnResult:
         """Hang up, write the transcript and release the line. Idempotent per session."""
+        if sess.wav is not None:
+            try:
+                sess.wav.close()
+            except Exception:
+                log.exception("call %s: could not close debug audio", sess.call_id)
+            sess.wav = None
         if sess.call is not None:
             try:
                 sess.call.hangup()
@@ -239,7 +253,10 @@ class CallManager:
         sess.note("Agent", message)
         det = self._detector_factory() if expect_reply else None
         try:
-            barged = self._speak(sess, message, barge=expect_reply and call.full_duplex, det=det)
+            c = self._cfg.conversation
+            grace = c.first_turn_grace_s if sess.turns == 1 else BARGE_GRACE_S
+            barge = expect_reply and c.barge_in and call.full_duplex
+            barged = self._speak(sess, message, barge=barge, det=det, grace_s=grace)
             if barged:
                 sess.lines[-1] = (*sess.lines[-1][:2], message + " [interrupted]")
             if not expect_reply:
@@ -256,7 +273,8 @@ class CallManager:
         return self._between_turns(sess, TurnResult(Status.IN_CALL, user_said=text,
                                                     call_id=sess.call_id))
 
-    def _speak(self, sess: _Session, text: str, barge: bool, det=None) -> bool:
+    def _speak(self, sess: _Session, text: str, barge: bool, det=None,
+               grace_s: float = BARGE_GRACE_S) -> bool:
         """Play `text`, streaming TTS sentences as they come. Returns True on barge-in.
 
         Raises _CallEnded (with the partial reply if the user was talking) if the call drops.
@@ -269,13 +287,20 @@ class CallManager:
         plock = threading.Lock()
         errors: list[BaseException] = []
 
+        t_speak = time.monotonic()
+
         def produce():
+            first = True
             try:
                 for chunk in self._tts.synthesize(text):
                     with plock:
                         if cancel.is_set():
                             break
                         call.play(chunk)
+                    if first:
+                        first = False
+                        log.info("call %s: timing: message -> first TTS chunk queued %.2f s",
+                                 sess.call_id, time.monotonic() - t_speak)
             except BaseException as e:  # noqa: BLE001 - re-raised in the turn thread
                 errors.append(e)
             finally:
@@ -285,24 +310,33 @@ class CallManager:
         sess.producer.start()
         played_frames = 0
         armed = False
+        need = max(1, self._cfg.conversation.barge_in_min_ms // FRAME_MS)
+        recent: deque[bool] = deque(maxlen=need + 300 // FRAME_MS)   # voiced flags, sliding window
         try:
             while True:
                 if errors:
                     raise errors[0]
-                frame = call.read(READ_POLL_S)
+                frame = self._read(sess, READ_POLL_S)
                 if frame is None:
                     if call.state is CallState.ENDED:
                         raise _CallEnded(self._partial(det) if armed else "")
                 elif barge and not armed:
                     if call.playing():
                         played_frames += 1
-                        armed = played_frames * FRAME_S >= BARGE_GRACE_S
-                elif barge and det.feed(frame) is TurnEvent.SPEECH_START:
-                    with plock:
-                        cancel.set()
-                        call.stop_playback()
-                    log.info("call %s: barge-in", sess.call_id)
-                    return True
+                        armed = played_frames * FRAME_S >= grace_s
+                elif barge:
+                    ev = det.feed(frame)
+                    recent.append(bool(det.last_voiced))
+                    if sum(recent) >= need:
+                        with plock:
+                            cancel.set()
+                            call.stop_playback()
+                        log.info("call %s: barge-in after %d voiced frames, noise floor %s",
+                                 sess.call_id, sum(recent), _db(det))
+                        return True
+                    if ev is TurnEvent.TURN_END:       # a short noise, not an interruption
+                        det.reset()
+                        recent.clear()
                 if done.is_set() and not call.playing():
                     if errors:
                         raise errors[0]
@@ -314,9 +348,12 @@ class CallManager:
         """Listen until TURN_END; return the transcript, or None if nobody spoke in time."""
         call = sess.call
         c = self._cfg.conversation
+        barged = speech_started
         t0, frames = time.monotonic(), 0
+        listen_start = t0
+        started_at = 0.0 if speech_started else None     # relative to listen start
         while True:
-            frame = call.read(READ_POLL_S * 2)
+            frame = self._read(sess, READ_POLL_S * 2)
             if frame is None:
                 if call.state is CallState.ENDED:
                     raise _CallEnded(self._partial(det) if speech_started else "")
@@ -325,8 +362,19 @@ class CallManager:
                 ev = det.feed(frame)
                 if ev is TurnEvent.SPEECH_START:
                     speech_started = True
+                    started_at = time.monotonic() - listen_start
                 elif ev is TurnEvent.TURN_END:
-                    text = self._stt.transcribe(det.utterance())
+                    pcm = det.utterance()
+                    began = "?" if started_at is None else f"{started_at:.2f}"
+                    log.info("call %s: turn: speech start %s s, end %.2f s after listen start, "
+                             "utterance %.2f s, noise floor %s, barge-in %s",
+                             sess.call_id, began,
+                             time.monotonic() - listen_start, len(pcm) / (SAMPLE_RATE * 2),
+                             _db(det), "yes" if barged else "no")
+                    t_stt = time.monotonic()
+                    text = self._stt.transcribe(pcm)
+                    log.info("call %s: timing: turn end -> STT done %.2f s",
+                             sess.call_id, time.monotonic() - t_stt)
                     if text:
                         return text
                     log.info("call %s: empty transcription, still listening", sess.call_id)
@@ -341,6 +389,24 @@ class CallManager:
             if speech_started and elapsed >= c.listen_timeout_s + c.max_turn_s + 5:
                 log.warning("call %s: detector never ended the turn; forcing it", sess.call_id)
                 return self._stt.transcribe(det.utterance())
+
+    def _read(self, sess: _Session, timeout: float) -> bytes | None:
+        """call.read(), plus the debug recording of incoming audio when enabled."""
+        frame = sess.call.read(timeout)
+        if frame is not None and self._cfg.conversation.debug_audio:
+            try:
+                if sess.wav is None:
+                    d = paths.logs_dir() / "audio"
+                    d.mkdir(exist_ok=True)
+                    sess.wav = wave.open(str(d / f"{sess.call_id}-in.wav"), "wb")  # noqa: SIM115
+                    sess.wav.setnchannels(1)
+                    sess.wav.setsampwidth(2)
+                    sess.wav.setframerate(SAMPLE_RATE)
+                sess.wav.writeframes(frame)
+            except Exception:
+                log.exception("call %s: debug audio failed; disabling", sess.call_id)
+                self._cfg.conversation.debug_audio = False
+        return frame
 
     def _partial(self, det) -> str:
         if det is None:
@@ -388,7 +454,7 @@ class CallManager:
         cue = self._cue()
         try:
             while not stop.is_set():
-                call.read(READ_POLL_S * 2)          # drain and discard
+                self._read(sess, READ_POLL_S * 2)    # drain and discard
                 if call.state is CallState.ENDED:
                     log.info("call %s: remote hangup between turns", sess.call_id)
                     self._remember(sess, TurnResult(Status.ENDED_BY_USER, call_id=sess.call_id,
@@ -447,4 +513,5 @@ class CallManager:
     def _default_detector(self):
         from .audio.vad import TurnDetector
         c = self._cfg.conversation
-        return TurnDetector(end_silence_ms=c.end_silence_ms, max_turn_s=c.max_turn_s)
+        return TurnDetector(end_silence_ms=c.end_silence_ms, max_turn_s=c.max_turn_s,
+                            aggressiveness=c.vad_aggressiveness)
