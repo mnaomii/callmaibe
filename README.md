@@ -281,9 +281,7 @@ debug_audio = false            # save incoming audio to <home>/logs/audio/<call_
 enabled = true                 # global kill switch default; sessions still need /call on
 decline_snooze_min = 30
 once_permit_min = 10           # how long /call now stays valid
-quiet_hours = [
-  { days = "mon-fri", from = "09:00", to = "17:00" },
-]
+quiet_hours = []               # none; e.g. [{ days = "mon-fri", from = "09:00", to = "17:00" }]
 
 [daemon]
 host = "127.0.0.1"
