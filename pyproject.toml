@@ -1,0 +1,47 @@
+[project]
+name = "callmaibe"
+version = "0.1.0"
+description = "Let your AI agent phone you: back-and-forth voice calls over SIP for MCP agents"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+dependencies = [
+    "keyring>=25",
+    "mcp>=2.3",
+    "numpy>=1.26",
+    "platformdirs>=4",
+]
+
+[project.optional-dependencies]
+speech = [
+    "faster-whisper>=1.0",
+    "kokoro-onnx>=0.4",
+    "soxr>=0.3",
+    "webrtcvad-wheels>=2.0.14",
+]
+sip = ["pjsua2-python>=2.15; platform_system == 'Linux' and python_version == '3.12'"]
+local = ["sounddevice>=0.4"]
+
+[project.scripts]
+callmaibe = "callmaibe.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "soundfile>=0.12"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/callmaibe"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: downloads models or runs real speech engines",
+    "sip: needs pjsua2 (Linux) and network",
+]
+addopts = "-m 'not slow and not sip'"

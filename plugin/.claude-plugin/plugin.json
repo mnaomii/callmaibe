@@ -1,0 +1,7 @@
+{
+  "name": "callmaibe",
+  "version": "0.1.0",
+  "description": "Let Claude Code phone you over SIP when a task finishes or it needs a decision.",
+  "license": "GPL-3.0-or-later",
+  "keywords": ["voice", "phone", "sip", "mcp"]
+}

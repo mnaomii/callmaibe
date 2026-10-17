@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "callmaibe": {
+      "command": "callmaibe",
+      "args": ["mcp"]
+    }
+  }
+}

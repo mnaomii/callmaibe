@@ -1,0 +1,82 @@
+"""Kokoro TTS via kokoro-onnx. Models are downloaded on first use."""
+
+import logging
+import os
+import re
+import urllib.request
+from collections.abc import Iterator
+from pathlib import Path
+
+from callmaibe import paths
+from callmaibe.audio.resample import to_internal
+from callmaibe.config import TTSCfg
+from callmaibe.tts.base import TTS
+
+log = logging.getLogger(__name__)
+
+_BASE_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+_VOICES = "voices-v1.0.bin"
+_MAX_SENTENCE = 200
+
+_URL = re.compile(r"https?://\S+|www\.\S+")
+_MARKUP = re.compile(r"[*`#>]|^\s*-\s+", re.MULTILINE)
+
+
+def clean(text: str) -> str:
+    text = _URL.sub("link", text)
+    text = _MARKUP.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    out: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", clean(text)):
+        if len(sentence) <= _MAX_SENTENCE:
+            out.append(sentence)
+            continue
+        cur = ""
+        for part in re.split(r"(?<=,)\s+", sentence):
+            if cur and len(cur) + len(part) >= _MAX_SENTENCE:
+                out.append(cur)
+                cur = part
+            else:
+                cur = f"{cur} {part}".strip()
+        out.append(cur)
+    return [s for s in out if re.search(r"\w", s)]
+
+
+def _fetch(name: str, dest: Path) -> Path:
+    path = dest / name
+    if path.exists():
+        return path
+    log.info("downloading %s", name)
+    part = path.with_name(name + ".part")
+    urllib.request.urlretrieve(_BASE_URL + name, part)
+    os.replace(part, path)
+    return path
+
+
+class KokoroTTS(TTS):
+    def __init__(self, cfg: TTSCfg):
+        self.cfg = cfg
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from kokoro_onnx import Kokoro
+
+            dest = paths.models_dir() / "kokoro"
+            dest.mkdir(exist_ok=True)
+            onnx = "kokoro-v1.0.int8.onnx" if self.cfg.variant == "int8" else "kokoro-v1.0.onnx"
+            self._model = Kokoro(str(_fetch(onnx, dest)), str(_fetch(_VOICES, dest)))
+        return self._model
+
+    def synthesize(self, text: str) -> Iterator[bytes]:
+        model = self._load()
+        for sentence in split_sentences(text):
+            samples, rate = model.create(sentence, voice=self.cfg.voice, speed=self.cfg.speed, lang="en-us")
+            yield to_internal(samples, rate)
+
+    def warmup(self) -> None:
+        for _ in self.synthesize("Hello."):
+            pass

@@ -1,0 +1,12 @@
+{
+  "description": "Handles the user typing /call on|off|now|status outside the model",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "callmaibe hook", "timeout": 15 }
+        ]
+      }
+    ]
+  }
+}

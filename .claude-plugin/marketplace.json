@@ -1,0 +1,12 @@
+{
+  "name": "callmaibe-marketplace",
+  "owner": { "name": "callmaibe" },
+  "description": "Plugins for callmaibe: phone calls from your AI agent.",
+  "plugins": [
+    {
+      "name": "callmaibe",
+      "source": "./plugin",
+      "description": "Let Claude Code phone you over SIP when a task finishes or it needs a decision."
+    }
+  ]
+}

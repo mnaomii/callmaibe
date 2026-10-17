@@ -1,0 +1,33 @@
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Secrets. callmaibe keeps passwords in the OS keyring and its state in a
+# per-user folder outside the repo; these patterns catch accidental copies.
+.env
+.env.*
+*.token
+*.pem
+*.key
+.claude/settings.local.json
+
+# callmaibe runtime state (config holds your SIP addresses)
+config.toml
+policy.json
+daemon.lock
+transcripts/
+logs/
+*.log
+*.bak-*
+
+# Models and audio
+models/
+*.onnx
+*.bin
+*.wav
