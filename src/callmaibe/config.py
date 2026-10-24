@@ -63,6 +63,8 @@ class STTCfg:
     language: str = "en"
     device: str = "auto"                            # auto | cpu | cuda
     compute_type: str = "int8"
+    # Tells Whisper what to expect: helps with short replies and jargon. "" turns it off.
+    prompt: str = "Phone call with a coding assistant. Yes, no, go ahead, wait."
 
 
 @dataclass

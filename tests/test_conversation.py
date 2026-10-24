@@ -1,5 +1,6 @@
 """Conversation engine against the fake telephony backend, fake TTS/STT and a scripted detector."""
 
+import threading
 import time
 import wave
 from pathlib import Path
@@ -148,6 +149,33 @@ def test_barge_in_stops_playback(make, cfg):
     assert len(call.played) < call.queued_bytes
     assert len(call.played) < tts_bytes(LONG) * 3 // 4
     assert stt.heard[0] >= len(speech(0.9))        # the interrupting speech is kept for STT
+
+
+class StuckTTS(FakeTTS):
+    """Queues the whole message, then hangs as if making one more sentence, until stop()."""
+
+    def __init__(self):
+        self.stopped = threading.Event()
+
+    def synthesize(self, text):
+        yield bytes(tts_bytes(text))
+        self.stopped.wait(5)
+
+    def stop(self):
+        self.stopped.set()
+
+
+def test_barge_in_stops_speech_synthesis(cfg):
+    cfg.conversation.first_turn_grace_s = 0.4
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[1.0, speech(0.9), 2.0])
+    tts = StuckTTS()
+    mgr = CallManager(tel, tts, FakeSTT("wait"), cfg, detector_factory=FakeDetector)
+    try:
+        assert mgr.start(LONG).status is Status.IN_CALL
+        assert tts.stopped.is_set()
+    finally:
+        mgr.close()
 
 
 def test_no_barge_in_from_hello_during_first_turn_grace(make):

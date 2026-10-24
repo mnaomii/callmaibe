@@ -69,6 +69,20 @@ def _fetch(name: str, dest: Path) -> Path:
     return path
 
 
+class _StoppableSession:
+    """kokoro-onnx's onnxruntime session, run with our options so stop() can end a sentence."""
+
+    def __init__(self, sess):
+        self._sess = sess
+        self.options = None
+
+    def run(self, output_names, input_feed, run_options=None):
+        return self._sess.run(output_names, input_feed, self.options)
+
+    def __getattr__(self, name):
+        return getattr(self._sess, name)
+
+
 class KokoroTTS(TTS):
     def __init__(self, cfg: TTSCfg):
         self.cfg = cfg
@@ -86,14 +100,30 @@ class KokoroTTS(TTS):
             dest = paths.models_dir() / "kokoro"
             dest.mkdir(exist_ok=True)
             onnx = "kokoro-v1.0.int8.onnx" if self.cfg.variant == "int8" else "kokoro-v1.0.onnx"
-            self._model = Kokoro(str(_fetch(onnx, dest)), str(_fetch(_VOICES, dest)))
+            model = Kokoro(str(_fetch(onnx, dest)), str(_fetch(_VOICES, dest)))
+            model.sess = _StoppableSession(model.sess)
+            self._model = model
         return self._model
 
     def synthesize(self, text: str) -> Iterator[bytes]:
+        from onnxruntime import RunOptions
+
         model = self._load()
+        options = model.sess.options = RunOptions()    # a fresh stop flag for each message
         for sentence in split_sentences(text):
-            samples, rate = model.create(sentence, voice=self.cfg.voice, speed=self.cfg.speed, lang="en-us")
+            try:
+                samples, rate = model.create(sentence, voice=self.cfg.voice, speed=self.cfg.speed, lang="en-us")
+            except Exception:
+                if options.terminate:                  # stop() ended this sentence
+                    return
+                raise
             yield to_internal(samples, rate)
+
+    def stop(self) -> None:
+        # A long sentence takes seconds to synthesize; ending it frees the CPU for STT.
+        options = self._model.sess.options if self._model is not None else None
+        if options is not None:
+            options.terminate = True
 
     def warmup(self) -> None:
         for _ in self.synthesize("Hello."):

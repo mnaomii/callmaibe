@@ -1,3 +1,4 @@
+import threading
 import time
 
 import numpy as np
@@ -139,6 +140,73 @@ def test_factories_reject_unknown():
         tts.create(TTSCfg(engine="nope"))
     with pytest.raises(ValueError):
         stt.create(STTCfg(engine="nope"))
+
+
+@pytest.mark.parametrize(("segments", "expected"), [
+    ([" No, no, no, no, no, no, no, no, no, no"], "No"),
+    ([" No, no, no."], "No, no, no."),
+    ([" I think that I think that I think that I think that works."], "I think that works."),
+    ([" Sounds good.", " Thanks for watching!"], "Sounds good."),
+    ([" Sounds good. Thank you for watching."], "Sounds good."),
+    ([" [BLANK_AUDIO]"], ""),
+    ([" Okay. (upbeat music)"], "Okay."),
+    ([" You"], ""),
+    ([" Thank you."], "Thank you."),
+    ([" Phone call with a coding assistant."], ""),
+    ([" No, go ahead."], "No, go ahead."),
+])
+def test_whisper_cleanup(segments, expected):
+    from callmaibe.stt.faster_whisper import clean
+
+    assert clean(segments, STTCfg().prompt) == expected
+
+
+def test_whisper_decodes_once_with_a_token_budget():
+    from types import SimpleNamespace
+
+    from callmaibe.stt.faster_whisper import FasterWhisperSTT
+
+    calls = []
+
+    class Model:
+        def transcribe(self, audio, **kw):
+            calls.append(kw)
+            return iter([SimpleNamespace(text=" Sounds good.")]), None
+
+    stt = FasterWhisperSTT(STTCfg())
+    stt._model = Model()
+    assert stt.transcribe(bytes(2 * SAMPLE_RATE * 2)) == "Sounds good."
+    stt.transcribe(bytes(10 * SAMPLE_RATE * 2))
+    short, long = calls
+    assert short["temperature"] == 0 and short["initial_prompt"] == STTCfg().prompt
+    assert 20 <= short["max_new_tokens"] < long["max_new_tokens"] <= 100
+
+
+def test_kokoro_stop_ends_the_sentence_being_made():
+    pytest.importorskip("onnxruntime")
+    from callmaibe.tts.kokoro import KokoroTTS, _StoppableSession
+
+    class Session:                  # like onnxruntime: runs until its options say terminate
+        def run(self, outputs, feed, options):
+            while not options.terminate:
+                time.sleep(0.01)
+            raise RuntimeError("Exiting due to terminate flag being set to true.")
+
+    class Model:
+        sess = _StoppableSession(Session())
+
+        def create(self, text, **kw):
+            return self.sess.run(None, {}), 24000
+
+    tts = KokoroTTS(TTSCfg())
+    tts._model = Model()
+    out = []
+    t = threading.Thread(target=lambda: out.extend(tts.synthesize("One. Two.")))
+    t.start()
+    time.sleep(0.05)
+    tts.stop()
+    t.join(2)
+    assert not t.is_alive() and out == []
 
 
 @pytest.fixture(scope="module")

@@ -263,6 +263,7 @@ model = "base.en"              # tiny.en | base.en | small.en ...; non-English n
 language = "en"
 device = "auto"                # auto | cpu | cuda
 compute_type = "int8"
+prompt = "Phone call with a coding assistant. Yes, no, go ahead, wait."   # hints for Whisper; "" = off
 
 [conversation]
 ring_timeout_s = 45            # give up if nobody answers

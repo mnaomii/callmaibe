@@ -347,6 +347,8 @@ class CallManager:
                     return False
         finally:
             cancel.set()
+            if not done.is_set():       # barge-in or hangup: don't finish the sentence being made
+                self._tts.stop()
 
     def _listen(self, sess: _Session, det, speech_started: bool, wait_s: float) -> str | None:
         """Listen until TURN_END; return the transcript, or None if nobody started within wait_s."""
