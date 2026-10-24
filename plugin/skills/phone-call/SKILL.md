@@ -19,6 +19,9 @@ Otherwise do not call. Do not call for small updates.
 1. `call_start`: open with a short summary of what you did and what you deliberated on and why.
    Then ask ONE question.
 2. Listen to `user_said`, then reply with `call_say`. One question at a time.
+   The phone keeps listening while you work. If they spoke meanwhile, your next message is
+   not said: you get `in_call` with what they said and a `reason` saying so. Answer that
+   first, then repeat what still matters.
 3. Finish with `call_end` and a short goodbye. Always end calls you started.
    If `call_end` returns `in_call`, the person talked over your goodbye.
    The call is still up: answer `user_said` with `call_say`, then end again.

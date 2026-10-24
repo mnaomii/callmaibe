@@ -15,11 +15,13 @@ Status.LINE_BUSY). Policy is NOT checked here; the daemon does that first.
 
 One turn = speak + listen. TTS sentences are queued on the call as soon as
 each is synthesized (a producer thread), while this thread keeps reading
-incoming frames into a TurnDetector so the user can barge in. When the user
-pauses mid-turn, a short "yeah" can play; when they stop, a spoken ack plays
-while STT runs. Between turns a
-background thread plays thinking fillers and the cue sound, drains incoming
-audio, notices a remote hangup and enforces idle_hangup_s / max_call_min.
+incoming frames into a TurnDetector so the user can barge in. Listening (an
+_Ear) never stops: in a turn and between turns alike, a short "yeah" can play
+in a pause, a phrase that only asks "can you hear me?" is answered at once,
+and a spoken ack plays while STT runs. Between turns a background thread also
+plays thinking fillers and the cue sound, notices a remote hangup and enforces
+idle_hangup_s / max_call_min. What the user says between turns is held and
+returned instead of saying the agent's next message.
 """
 
 import logging
@@ -38,7 +40,7 @@ from . import paths
 from .audio import FRAME_MS, SAMPLE_RATE
 from .audio.vad import TurnEvent
 from .config import Config
-from .fillers import Fillers
+from .fillers import Fillers, asks_if_heard, ends_asking_if_heard, hesitation, is_ours
 from .status import Status, TurnResult
 from .stt.base import STT
 from .telephony.base import Call, CallState, EndReason, Telephony
@@ -57,6 +59,13 @@ READ_POLL_S = 0.05
 BACKCHANNEL_PAUSE_MS = 400
 BACKCHANNEL_FIRST_S = 4.0    # talking this long earns the first one; short replies get none
 BACKCHANNEL_GAP_S = (5.0, 8.0)   # then a random wait in this range between them
+BACKCHANNEL_MIN_PHRASE_S = 1.5  # a short phrase may be a question ("Can you hear me?")
+# A pause this long ends a phrase. Its STT runs in the background: a phrase that only asks
+# "can you hear me?" gets an answer at once, and a one-phrase turn has its text sooner.
+PHRASE_PAUSE_FRAMES = 300 // FRAME_MS
+NOT_SAID = ("your message was not said: they spoke while you were working. Answer what they "
+            "said; repeat what still matters from your message.")
+NOT_HUNG_UP = "not hung up: they spoke while you were working. Answer what they said."
 
 _RING_END = {
     EndReason.DECLINED: Status.DECLINED,
@@ -80,6 +89,8 @@ class _Session:
     producer: threading.Thread | None = None
     done: bool = False
     wav: wave.Wave_write | None = None
+    ear: "_Ear | None" = None           # the between-turns listener, handed to the next turn
+    pending: list[str] = field(default_factory=list)   # said while the agent worked
 
     def note(self, who: str, text: str) -> None:
         if text:
@@ -93,6 +104,165 @@ def _db(det) -> str:
 
 class _CallEnded(Exception):
     pass
+
+
+class _Peek:
+    """STT of one phrase, run in the background during the pause after it."""
+
+    def __init__(self, stt: STT, pcm: bytes, at: int, whole: bool):
+        self.at = at                    # frame count when it began
+        self.whole = whole              # the phrase is the whole utterance so far
+        self.ok = True
+        self.text = ""
+        self._seen = False
+        self._thread = threading.Thread(target=self._run, args=(stt, pcm),
+                                        name="callmaibe-peek", daemon=True)
+        self._thread.start()
+
+    def _run(self, stt: STT, pcm: bytes) -> None:
+        try:
+            self.text = stt.transcribe(pcm)
+        except Exception:
+            log.exception("STT in a pause failed")
+            self.ok = False
+
+    def fresh(self) -> bool:
+        """True once, when the text is ready."""
+        if self._seen or self._thread.is_alive():
+            return False
+        self._seen = True
+        return True
+
+    def result(self) -> str:
+        self._thread.join()
+        self._seen = True
+        return self.text
+
+
+class _Ear:
+    """Hears the person frame by frame, the same way in a turn and while the agent works.
+
+    A pause of PHRASE_PAUSE_FRAMES ends a phrase, and its STT runs in the background: a phrase
+    that ends asking "can you hear me?" gets an answer at once. A longer pause after a longer
+    phrase can get a "yeah". When the detector ends the utterance, an ack plays while STT runs
+    and feed() returns the text, or "" when there is nothing to pass on (noise, "uh", a check).
+    """
+
+    def __init__(self, mgr: "CallManager", sess: _Session, det, barged: bool = False,
+                 label: str = "after listen start"):
+        self._mgr = mgr
+        self._sess = sess
+        self.det = det
+        self._label = label
+        self._heard = 0                 # frames fed: the call's clock
+        self._new_utterance(barged)
+
+    @property
+    def in_speech(self) -> bool:
+        return bool(self.det.in_speech) or self._barged
+
+    def _new_utterance(self, barged: bool) -> None:
+        self._barged = barged           # it began while we spoke
+        self._started_s = 0.0 if barged else None
+        self._pause = 0                 # unvoiced frames in a row
+        self._voiced_at = 0             # frame count at the latest voiced frame
+        self._phrase_bytes = 0          # where the latest phrase starts in det.utterance()
+        self._phrase_at = self._heard   # ...and at which frame
+        self._phrase_s = 0.0            # length of the phrase that just ended
+        self._peek: _Peek | None = None
+        self._next_bc = self._heard * FRAME_S + BACKCHANNEL_FIRST_S
+        self._holding = False           # our "yeah" or answer plays: their pause doesn't count yet
+        self._spoke_last = False        # ...and they haven't talked past it
+        self._answered = False          # ...and it was the answer to "can you hear me?"
+
+    def feed(self, frame: bytes) -> str | None:
+        mgr, call = self._mgr, self._sess.call
+        c = mgr._cfg.conversation
+        self._heard += 1
+        now_s = self._heard * FRAME_S
+        self._holding = self._holding and call.playing()
+        if self._holding:
+            self.det.hold()
+        ev = self.det.feed(frame)
+        if self.det.last_voiced:
+            self._pause, self._voiced_at = 0, self._heard
+            if not self._holding:
+                self._spoke_last = self._answered = False
+        else:
+            self._pause += 1
+        peek = self._peek
+        if peek is not None and peek.fresh() and c.fillers and ends_asking_if_heard(peek.text):
+            mgr._answer_check(self._sess)
+            self._holding = self._spoke_last = self._answered = True
+        if ev is TurnEvent.SPEECH_START:
+            self._started_s = now_s
+            self._phrase_at = self._heard
+            self._next_bc = now_s + BACKCHANNEL_FIRST_S
+        elif ev is TurnEvent.TURN_END:
+            return self._utterance_end(now_s)
+        elif ev is TurnEvent.NONE and self.in_speech:
+            if self._pause == PHRASE_PAUSE_FRAMES:
+                self._phrase_end()
+            elif (c.fillers and self._pause * FRAME_MS >= BACKCHANNEL_PAUSE_MS
+                  and now_s >= self._next_bc and self._phrase_s >= BACKCHANNEL_MIN_PHRASE_S
+                  and not call.playing()):
+                if bc := mgr._fillers.backchannel():
+                    call.play(bc)
+                    self._holding = self._spoke_last = True
+                    log.info("call %s: backchannel %.1f s %s", self._sess.call_id, now_s,
+                             self._label)
+                self._next_bc = now_s + random.uniform(*BACKCHANNEL_GAP_S)
+        return None
+
+    def _phrase_end(self) -> None:
+        pcm = self.det.utterance()
+        self._peek = _Peek(self._mgr._stt, pcm[self._phrase_bytes:], at=self._heard,
+                           whole=self._phrase_bytes == 0)
+        self._phrase_bytes = len(pcm)
+        self._phrase_s = (self._voiced_at - self._phrase_at) * FRAME_S
+        self._phrase_at = self._heard
+
+    def _utterance_end(self, now_s: float) -> str:
+        mgr, sess, call = self._mgr, self._sess, self._sess.call
+        c = mgr._cfg.conversation
+        pcm = self.det.utterance()
+        began = "?" if self._started_s is None else f"{self._started_s:.2f}"
+        log.info("call %s: turn: speech start %s s, end %.2f s %s, utterance %.2f s, "
+                 "noise floor %s, barge-in %s", sess.call_id, began, now_s, self._label,
+                 len(pcm) / (SAMPLE_RATE * 2), _db(self.det), "yes" if self._barged else "no")
+        t_stt = time.monotonic()
+        peek = self._peek
+        last = peek if peek is not None and peek.ok and self._voiced_at < peek.at else None
+        if last is not None:            # STT of the last phrase began in the pause: use it first
+            last.result()
+            if c.fillers and not self._answered and ends_asking_if_heard(last.text):
+                mgr._answer_check(sess)
+                self._answered = self._spoke_last = True
+        known = last is not None and last.whole
+        text = last.text if known else None
+        ack = None
+        if c.fillers and not (self._spoke_last or call.playing()):
+            ack = mgr._fillers.ack()            # "Got it." while STT runs
+            if ack:                             # (a "yeah" they didn't talk past is enough)
+                call.play(ack)
+        if text is None:
+            text = mgr._stt.transcribe(pcm)
+        log.info("call %s: timing: turn end -> STT done %.2f s%s", sess.call_id,
+                 time.monotonic() - t_stt, " (begun in the pause)" if known else "")
+        if c.fillers and not self._answered and ends_asking_if_heard(text):
+            mgr._answer_check(sess)
+        if c.fillers and asks_if_heard(text):           # only the check: nothing to pass on
+            sess.note("You", text + " [the phone answered]")
+            text = ""
+        elif not text or hesitation(text):
+            log.info("call %s: %s, nothing to pass on", sess.call_id,
+                     "only a hesitation" if text else "empty transcription")
+            if ack:
+                call.stop_playback()
+            text = ""
+        self.det.reset()
+        self._new_utterance(barged=False)
+        return text
 
 
 class CallManager:
@@ -166,6 +336,9 @@ class CallManager:
             try:
                 if message:
                     return self._turn(sess, message, expect_reply=False, ending=True)
+                if held := self._held(sess):
+                    return self._between_turns(sess, TurnResult(
+                        Status.IN_CALL, user_said=held, call_id=sess.call_id, reason=NOT_HUNG_UP))
                 return self._finish(sess, TurnResult(Status.ENDED, call_id=sess.call_id))
             except Exception as e:  # noqa: BLE001 - any failure becomes ERROR
                 return self._fail(sess, e)
@@ -263,21 +436,28 @@ class CallManager:
     def _turn(self, sess: _Session, message: str, expect_reply: bool,
               ending: bool = False) -> TurnResult:
         """Speak `message`, then listen. The person can talk over any message, a goodbye
-        (`ending`) too; then the call stays up. After a goodbye in full we hang up at once."""
+        (`ending`) too; then the call stays up. After a goodbye in full we hang up at once.
+        If they spoke while the agent worked, `message` is not said: they go first."""
         call = sess.call
         c = self._cfg.conversation
         sess.turns += 1
-        sess.note("Agent", message)
-        det = self._detector_factory()
         try:
+            if held := self._held(sess):
+                sess.note("Agent", message + " [not said: they spoke first]")
+                log.info("call %s: message held back, they spoke while the agent worked",
+                         sess.call_id)
+                return self._between_turns(sess, TurnResult(
+                    Status.IN_CALL, user_said=held, call_id=sess.call_id, reason=NOT_SAID))
+            sess.note("Agent", message)
+            det = self._detector_factory()
             grace = c.first_turn_grace_s if sess.turns == 1 else BARGE_GRACE_S
             barge = c.barge_in and call.full_duplex
             barged = self._speak(sess, message, barge=barge, det=det, grace_s=grace)
             if barged:
                 sess.lines[-1] = (*sess.lines[-1][:2], message + " [interrupted]")
             wait_s = c.listen_timeout_s if expect_reply else 0.0
-            talking = barged or det.in_speech
-            text = self._listen(sess, det, talking, wait_s) if talking or wait_s else None
+            ear = _Ear(self, sess, det, barged=barged)
+            text = self._listen(sess, ear, wait_s) if ear.in_speech or wait_s else None
         except _CallEnded as e:
             text = e.args[0] if e.args else ""
             sess.note("You", text)
@@ -365,77 +545,47 @@ class CallManager:
             if not done.is_set():       # barge-in or hangup: don't finish the sentence being made
                 self._tts.stop()
 
-    def _listen(self, sess: _Session, det, speech_started: bool, wait_s: float) -> str | None:
-        """Listen until TURN_END; return the transcript, or None if nobody started within wait_s."""
+    def _listen(self, sess: _Session, ear: _Ear, wait_s: float) -> str | None:
+        """Listen until they finish saying something to pass on; None if nobody started
+        within wait_s."""
         call = sess.call
         c = self._cfg.conversation
-        barged = speech_started
         t0, frames = time.monotonic(), 0
-        listen_start = t0
-        started_at = 0.0 if speech_started else None     # relative to listen start
-        heard = pause = 0               # frames read (the call's clock), unvoiced frames in a row
-        next_bc = BACKCHANNEL_FIRST_S   # in seconds of that clock
-        holding = bc_unanswered = False
         while True:
             frame = self._read(sess, READ_POLL_S * 2)
             if frame is None:
                 if call.state is CallState.ENDED:
-                    raise _CallEnded(self._partial(det) if speech_started else "")
+                    raise _CallEnded(self._partial(ear.det) if ear.in_speech else "")
             else:
                 frames += 1
-                heard += 1
-                now_s = heard * FRAME_S
-                holding = holding and call.playing()
-                if holding:
-                    det.hold()          # our "yeah" is playing: their pause doesn't count yet
-                ev = det.feed(frame)
-                pause = 0 if det.last_voiced else pause + 1
-                if det.last_voiced and not holding:
-                    bc_unanswered = False
-                if ev is TurnEvent.SPEECH_START:
-                    speech_started = True
-                    started_at = time.monotonic() - listen_start
-                    next_bc = now_s + BACKCHANNEL_FIRST_S
-                elif (ev is TurnEvent.NONE and speech_started and c.fillers and now_s >= next_bc
-                      and pause * FRAME_MS >= BACKCHANNEL_PAUSE_MS and not call.playing()):
-                    if bc := self._fillers.backchannel():          # "yeah" while they talk
-                        call.play(bc)
-                        holding = bc_unanswered = True
-                        log.info("call %s: backchannel %.1f s into the turn", sess.call_id, now_s)
-                    next_bc = now_s + random.uniform(*BACKCHANNEL_GAP_S)
-                elif ev is TurnEvent.TURN_END:
-                    pcm = det.utterance()
-                    began = "?" if started_at is None else f"{started_at:.2f}"
-                    log.info("call %s: turn: speech start %s s, end %.2f s after listen start, "
-                             "utterance %.2f s, noise floor %s, barge-in %s",
-                             sess.call_id, began,
-                             time.monotonic() - listen_start, len(pcm) / (SAMPLE_RATE * 2),
-                             _db(det), "yes" if barged else "no")
-                    # a "yeah" they didn't talk past is ack enough
-                    ack = (self._fillers.ack() if c.fillers and not call.playing()
-                           and not bc_unanswered else None)
-                    if ack:                                  # "Got it." while STT runs
-                        call.play(ack)
-                    t_stt = time.monotonic()
-                    text = self._stt.transcribe(pcm)
-                    log.info("call %s: timing: turn end -> STT done %.2f s",
-                             sess.call_id, time.monotonic() - t_stt)
-                    if text:
-                        return text
-                    log.info("call %s: empty transcription, still listening", sess.call_id)
-                    if ack:
-                        call.stop_playback()
-                    det.reset()
-                    speech_started = False
+                text = ear.feed(frame)
+                if text:
+                    return text
+                if text == "":                      # noise, "uh" or a line check: listen on
                     t0, frames = time.monotonic(), 0
-                    continue
             # frames arrive in real time on a real line; the frame count also keeps fast fakes honest
             elapsed = max(time.monotonic() - t0, frames * FRAME_S)
-            if not speech_started and elapsed >= wait_s:
+            if not ear.in_speech and elapsed >= wait_s:
                 return None
-            if speech_started and elapsed >= wait_s + c.max_turn_s + 5:
+            if ear.in_speech and elapsed >= wait_s + c.max_turn_s + 5:
                 log.warning("call %s: detector never ended the turn; forcing it", sess.call_id)
-                return self._stt.transcribe(det.utterance())
+                return self._stt.transcribe(ear.det.utterance())
+
+    def _held(self, sess: _Session) -> str:
+        """What they said while the agent worked, including what they are saying right now."""
+        ear, sess.ear = sess.ear, None
+        if ear is not None and ear.in_speech and (text := self._listen(sess, ear, 0.0)):
+            sess.pending.append(text)
+            sess.note("You", text)
+        said, sess.pending = " ".join(sess.pending), []
+        return said
+
+    def _answer_check(self, sess: _Session) -> None:
+        """Answer "can you hear me?" right away, instead of waiting for the agent."""
+        sess.call.stop_playback()
+        if reply := self._fillers.heard_you():
+            sess.call.play(reply)
+        log.info("call %s: answered a can-you-hear-me", sess.call_id)
 
     def _read(self, sess: _Session, timeout: float) -> bytes | None:
         """call.read(), plus the debug recording of incoming audio when enabled."""
@@ -509,12 +659,21 @@ class CallManager:
         max_deadline = sess.answered_mono + c.max_call_min * 60
         next_cue = start + FIRST_CUE_S
         slot = 0
+        ear = sess.ear = _Ear(self, sess, self._detector_factory(), label="between turns")
         try:
             while not stop.is_set():
-                self._read(sess, READ_POLL_S * 2)    # drain and discard
+                frame = self._read(sess, READ_POLL_S * 2)
+                # what they say now goes to the agent before its next message (echo of our
+                # own fillers aside)
+                if frame is not None and (text := ear.feed(frame)) and not is_ours(text):
+                    sess.pending.append(text)
+                    sess.note("You", text)
+                    log.info("call %s: heard while the agent works; it gets this first",
+                             sess.call_id)
                 if call.state is CallState.ENDED:
                     log.info("call %s: remote hangup between turns", sess.call_id)
                     self._remember(sess, TurnResult(Status.ENDED_BY_USER, call_id=sess.call_id,
+                                                    user_said=" ".join(sess.pending),
                                                     reason="you hung up"))
                     return
                 now = time.monotonic()
@@ -532,8 +691,8 @@ class CallManager:
                     self._remember(sess, TurnResult(Status.ENDED, call_id=sess.call_id,
                                                     reason=reason))
                     return
-                if now >= next_cue and not call.playing():     # wait for the ack to finish
-                    if pcm := self._idle_sound(slot, heard):
+                if now >= next_cue and not call.playing() and not ear.in_speech:
+                    if pcm := self._idle_sound(slot, heard):    # (after any ack, not over them)
                         call.play(pcm)
                     slot += 1
                     next_cue = now + self._cue_interval

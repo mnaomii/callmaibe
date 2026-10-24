@@ -77,7 +77,7 @@ class ConversationCfg:
     idle_hangup_s: float = 120                      # agent silent this long between turns -> hang up
     max_call_min: float = 20
     thinking_cue: bool = True
-    fillers: bool = True                            # "Got it." when you stop, "Let me check." while it works
+    fillers: bool = True                            # spoken "yeah", "got it", "let me check"; answers "can you hear me?"
     keep_transcripts: bool = True
     barge_in: bool = True                           # let you interrupt the agent while it speaks
     barge_in_min_ms: int = 700                      # sustained speech needed to interrupt

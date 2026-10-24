@@ -42,7 +42,7 @@ Status: early, but real calls work: tested over Wi-Fi and mobile data, see [Proj
 
 ## Features
 
-- Spoken multi-turn conversation: silence-based end of turn, a short "yeah" in your pauses and "got it" when you stop talking, spoken fillers ("let me check", "still on it") and a soft sound while the agent works.
+- Spoken multi-turn conversation: silence-based end of turn, a short "yeah" in your pauses and "got it" when you stop talking, spoken fillers ("let me check", "still on it") and a soft sound while the agent works. It keeps listening while the agent works: what you say then reaches the agent before its next message, and "Can you hear me?" (as its own phrase) is answered at once.
 - Per-session on/off switch, a global kill switch, snooze, weekly quiet hours.
 - Declining a call on your phone snoozes calling for a while (default 30 minutes).
 - Claude Code plugin: `/call` command, a skill that teaches the agent when and how to phone.
@@ -273,7 +273,7 @@ max_turn_s = 60
 idle_hangup_s = 120            # agent silent this long between turns -> hang up
 max_call_min = 20
 thinking_cue = true            # soft sound while the agent thinks
-fillers = true                 # "Got it." when you stop talking, "Let me check." while the agent works
+fillers = true                 # spoken "yeah", "got it", "let me check"; answers "can you hear me?" itself
 keep_transcripts = true
 barge_in = true                # you can interrupt the agent by talking over it
 barge_in_min_ms = 700          # sustained speech needed to interrupt (short noises are ignored)

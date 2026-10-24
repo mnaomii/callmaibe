@@ -14,6 +14,8 @@ from .session import session_key
 
 STATUSES = """Result has `status`:
 - in_call: call is up; `user_said` is what the person said. Answer with call_say.
+  If `reason` says your message was not said, they spoke while you were working:
+  answer `user_said` first, then repeat what still matters.
 - no_reply: call is up but they said nothing. Ask once more with call_say, or call_end.
 - ended_by_user: they hung up; `user_said` holds their last words. Act on what was decided.
 - ended: call over.
@@ -25,7 +27,8 @@ STATUSES = """Result has `status`:
 
 STYLE = ("Phone style: short plain sentences, one question at a time, no markdown, code, "
          "file paths or URLs; say numbers naturally. The phone already says fillers like "
-         "'got it' and 'let me check' while you work, so start with the answer.")
+         "'got it' and 'let me check' while you work and answers 'can you hear me' itself, "
+         "so start with the answer.")
 
 mcp = FastMCP("callmaibe", instructions="Phone the user over a real call. " + STYLE)
 

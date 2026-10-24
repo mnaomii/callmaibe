@@ -79,8 +79,9 @@ class FakeDetector:
                 return TurnEvent.TURN_END
         return TurnEvent.NONE
 
-    def utterance(self):
-        return bytes(self.buf)
+    def utterance(self):                # like the real one: keeps 200 ms of trailing silence
+        cut = max(0, self.silent - 10) * FRAME_BYTES
+        return bytes(self.buf[:len(self.buf) - cut])
 
     def hold(self):
         self.silent = 0
@@ -390,6 +391,7 @@ class FakeFillers:
     BC = b"\x04\x00" * 12800           # 0.8 s, like a real "yeah"
     ACK = b"\x05\x00" * 1600
     THINK = b"\x06\x00" * 1600
+    HEARD = b"\x03\x00" * 1600
 
     def __init__(self):
         self.asked = []
@@ -405,6 +407,120 @@ class FakeFillers:
     def thinking(self, first):
         self.asked.append("first" if first else "still")
         return self.THINK
+
+    def heard_you(self):
+        self.asked.append("heard")
+        return self.HEARD
+
+
+@pytest.mark.parametrize(("incoming", "replies", "answered"), [
+    # "I ate lasagna." pause "Okay, can you hear me?" pause "Good, push it."
+    ([0.5, speech(1.0), 0.6, speech(1.0), 0.6, speech(1.0), 1.5],
+     ["I ate lasagna.", "Okay, can you hear me?", "Good, push it.",
+      "I ate lasagna. Okay, can you hear me? Good, push it."], True),
+    # one phrase that ends asking: answered, and the agent still gets it all
+    ([0.5, speech(2.0), 1.5], ["I ate lasagna and can you hear me?"], True),
+    # the check is not at the end of the phrase: the agent answers it
+    ([0.5, speech(2.0), 1.5], ["Can you hear me if I talk from the kitchen?"], False),
+])
+def test_check_phrase_is_answered_at_once(cfg, incoming, replies, answered):
+    # turns end after 1 s of silence here; a 0.3 s pause ends a phrase
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=incoming)
+    f = FakeFillers()
+    mgr = CallManager(tel, FakeTTS(), FakeSTT(*replies), cfg,
+                      detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
+    try:
+        r = mgr.start(SHORT)
+        assert r.status is Status.IN_CALL and r.user_said == replies[-1]
+        assert f.asked.count("heard") == (1 if answered else 0)
+    finally:
+        mgr.close()
+
+
+def test_check_that_ends_the_turn_is_answered_before_the_full_stt(cfg):
+    class SlowSTT(FakeSTT):                # the phrase's STT is still running at the turn end
+        def transcribe(self, pcm):
+            text = super().transcribe(pcm)
+            time.sleep(0.2)
+            return text
+
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(1.0), 0.6, speech(1.0), 1.5])
+    f = FakeFillers()
+    stt = SlowSTT("Something is in the oven.", "Can you hear me?",
+                  "Something is in the oven. Can you hear me?")
+    mgr = CallManager(tel, FakeTTS(), stt, cfg,
+                      detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
+    try:
+        r = mgr.start(SHORT)
+        assert r.user_said == "Something is in the oven. Can you hear me?"   # the agent gets it
+        assert f.asked == ["heard"]                     # answered, and no "Got it." on top
+    finally:
+        mgr.close()
+
+
+@pytest.mark.parametrize("final", ["say", "end"])
+def test_speech_while_the_agent_works_goes_first(make, final):
+    mgr, tel, stt = make("ok", "and also fix the tests",
+                         incoming=[0.5, speech(0.3), 1.0, speech(0.5), 3.0])
+    r = mgr.start(SHORT)
+    assert r.user_said == "ok"
+    assert wait_for(lambda: len(stt.heard) == 2)        # heard while the agent worked
+    queued = tel.last_call.queued_bytes
+    if final == "say":
+        r2 = mgr.say(r.call_id, "Here is my answer.")
+        assert r2.reason == conversation.NOT_SAID
+    else:
+        r2 = mgr.end(r.call_id)
+        assert r2.reason == conversation.NOT_HUNG_UP
+    assert r2.status is Status.IN_CALL and r2.user_said == "and also fix the tests"
+    assert tel.last_call.queued_bytes == queued         # the message was not played
+    r3 = mgr.say(r.call_id, "Sure, fixing them too.", expect_reply=False)
+    assert r3.status is Status.IN_CALL and r3.reason == ""
+    assert tel.last_call.queued_bytes > queued
+
+
+def test_check_while_the_agent_works_is_answered_not_passed_on(cfg):
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(0.3), 1.0, speech(0.5), 3.0])
+    f, stt = FakeFillers(), FakeSTT("ok", "Hello? Can you hear me?")
+    mgr = CallManager(tel, FakeTTS(), stt, cfg, detector_factory=FakeDetector, fillers=f)
+    try:
+        r = mgr.start(SHORT)
+        assert wait_for(lambda: "heard" in f.asked)
+        r2 = mgr.say(r.call_id, "Yes. The tests pass.", expect_reply=False)
+        assert r2.status is Status.IN_CALL and r2.reason == "" and r2.user_said == ""
+    finally:
+        mgr.close()
+
+
+def test_turn_end_reuses_stt_from_the_pause(cfg):
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(0.5), 2.0])
+    stt = FakeSTT("push it")
+    mgr = CallManager(tel, FakeTTS(), stt, cfg, detector_factory=lambda: FakeDetector(end_frames=50))
+    try:
+        assert mgr.start(SHORT).user_said == "push it"
+        assert len(stt.heard) == 1                  # begun 0.3 s into the pause, used at 1 s
+    finally:
+        mgr.close()
+
+
+@pytest.mark.parametrize("first", ["Hello? Can you hear me?", "Uh."])
+def test_check_or_hesitation_does_not_end_the_turn(cfg, first):
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(0.5), 1.0, speech(0.5), 1.0])
+    f = FakeFillers()
+    mgr = CallManager(tel, FakeTTS(), FakeSTT(first, "push it"), cfg,
+                      detector_factory=FakeDetector, fillers=f)
+    try:
+        r = mgr.start(SHORT)
+        assert r.status is Status.IN_CALL and r.user_said == "push it"
+        answered = f.HEARD in bytes(tel.last_call.played)
+        assert answered is (first != "Uh.")          # the phone answers the check itself
+    finally:
+        mgr.close()
 
 
 def test_fillers_ack_then_think_while_the_agent_works(cfg, monkeypatch):
@@ -438,7 +554,7 @@ def test_backchannel_gives_time_to_go_on(cfg, go_on):
     rest = [speech(1.0), 1.5] if go_on else [2.0]
     tel = FakeTelephony(speed=100)
     tel.script(incoming=[0.5, speech(4.5), 1.2, *rest])
-    f, stt = FakeFillers(), FakeSTT("long story")
+    f, stt = FakeFillers(), FakeSTT(*["long story"] * 3)    # STT of each phrase, then the turn
     mgr = CallManager(tel, FakeTTS(), stt, cfg,
                       detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
     try:
@@ -446,7 +562,7 @@ def test_backchannel_gives_time_to_go_on(cfg, go_on):
         assert r.status is Status.IN_CALL and r.user_said == "long story"
         assert f.BC in bytes(tel.last_call.played)
         if go_on:
-            assert stt.heard[0] >= len(speech(7.5))     # 4.5 + 1.2 pause + 1.0 + 1.0: one turn
+            assert stt.heard[-1] >= len(speech(6.5))    # 4.5 + 1.2 pause + 1.0 + 0.2: one turn
             assert f.asked == ["bc", "ack"]
         else:
             assert f.asked == ["bc"]                    # a "yeah" they didn't talk past: no ack

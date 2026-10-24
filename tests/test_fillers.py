@@ -2,12 +2,14 @@
 
 from itertools import pairwise
 
+import pytest
+
 from callmaibe import fillers
 from callmaibe.config import TTSCfg
 from callmaibe.fillers import Fillers
 from callmaibe.tts.base import TTS
 
-ALL = fillers.BACKCHANNELS + fillers.ACKS + fillers.THINKING + fillers.STILL
+ALL = fillers.BACKCHANNELS + fillers.ACKS + fillers.HEARD_YOU + fillers.THINKING + fillers.STILL
 
 
 class CountingTTS(TTS):
@@ -54,3 +56,51 @@ def test_render_waits_while_a_call_is_active(monkeypatch, tmp_path):
     tts = CountingTTS()
     Fillers(tts, TTSCfg()).render(busy=lambda: next(busy, False))
     assert waits == [1, 1] and len(tts.made) == len(ALL)
+
+
+@pytest.mark.parametrize(("text", "check"), [
+    ("Can you hear me?", True),
+    ("Hello? Can you hear me?", True),
+    ("Hello?", True),
+    ("Hello, hello?", True),
+    ("Hey, are you still there?", True),
+    ("Claude, can you hear me now?", True),
+    ("Okay, but can you hear me?", True),
+    ("Actually, can you hear me?", True),
+    ("Can you hear me? Can you hear me?", True),
+    ("I was putting something in the oven and can you hear me?", False),
+    ("Can you hear me? I want to change the plan.", False),
+    ("Hi.", False),
+    ("Can I see you?", False),
+    ("Yes, go ahead.", False),
+])
+def test_asks_if_heard(text, check):
+    assert fillers.asks_if_heard(text) is check
+
+
+@pytest.mark.parametrize(("text", "only"), [
+    ("Uh", True), ("Um...", True), ("Uh, um.", True), ("Hmm.", True),
+    ("Mm-hmm.", False),                 # that one means yes
+    ("Uh, push it.", False), ("No.", False),
+])
+def test_hesitation(text, only):
+    assert fillers.hesitation(text) is only
+
+
+def test_is_ours():
+    assert fillers.is_ours("Still on it.") and fillers.is_ours("let me check")
+    assert not fillers.is_ours("Let me check the tests first.")
+
+
+@pytest.mark.parametrize(("text", "check"), [
+    ("Okay, so I'm putting something in the oven. Can you hear me?", True),
+    ("I ate lasagna and can you hear me now?", True),
+    ("Okay, so can you hit me?", True),
+    ("Right, and you hear me?", True),
+    ("Wait, are you still with me?", True),
+    ("Did you hear the news today?", False),
+    ("Can you hear me if I talk from the kitchen?", False),
+    ("Tell them I said hello.", False),
+])
+def test_ends_asking_if_heard(text, check):
+    assert fillers.ends_asking_if_heard(text) is check

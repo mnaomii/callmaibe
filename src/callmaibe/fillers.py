@@ -11,6 +11,7 @@ so all of them are made once and cached on disk.
 import hashlib
 import os
 import random
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -39,6 +40,56 @@ STILL = (
     "Thanks for waiting.", "One more moment.", "Bear with me a moment.", "Still here.",
     "This is taking a moment.", "Still going.",
 )
+HEARD_YOU = ("Yes, I can hear you.", "Yes, I'm here.", "I'm here, I can hear you.",
+             "Yes, loud and clear.")
+
+# A phrase (speech between pauses) that only checks the line, "Okay, but can you hear me?",
+# gets HEARD_YOU at once instead of a trip to the agent. A whole turn of "uh" means they're
+# still thinking.
+_CHECK = re.compile(r"\b(?:(?:(?:can|could|do) )?you (?:hear|here|hit)(?: me)?"  # Whisper: "hit"
+                    r"|(?:are )?you (?:still )?(?:there|with me|listening)"
+                    r"|(?:is )?any(?:one|body) there)\b")
+_SMALL_WORDS = {"okay", "ok", "but", "so", "actually", "hey", "hello", "hi", "um", "uh", "oh",
+                "claude", "now", "well", "wait", "sorry", "like", "yeah", "and", "then", "still",
+                "again", "right", "just"}     # all that may surround a check
+_HELLO = re.compile(r"(?:hello\s?)+")  # "Hello? Hello?"
+_HESITATION = re.compile(r"(?:(?:uh+|um+|uhm|er+|ah+|hmm+)\s?)+")
+
+
+def _words(text: str) -> str:
+    return " ".join(re.findall(r"[a-z']+", text.lower()))
+
+
+def asks_if_heard(text: str) -> bool:
+    """`text` is only a line check: nothing to pass on to the agent."""
+    w = _words(text)
+    if not _CHECK.search(w):
+        return bool(_HELLO.fullmatch(w))
+    return all(x in _SMALL_WORDS for x in _CHECK.sub(" ", w).split())
+
+
+def ends_asking_if_heard(text: str) -> bool:
+    """`text` ends with a line check, whatever came before it ("...in the oven. Can you hear
+    me?"): answer it at once; the rest still goes to the agent."""
+    w = _words(text)
+    last = None
+    for last in _CHECK.finditer(w):
+        pass
+    if last is None:
+        return bool(_HELLO.fullmatch(w))
+    return all(x in _SMALL_WORDS for x in w[last.end():].split())
+
+
+def hesitation(text: str) -> bool:
+    return bool(_HESITATION.fullmatch(_words(text)))
+
+
+def is_ours(text: str) -> bool:
+    """`text` is one of our own phrases: our echo on the line, not the person."""
+    return _words(text) in _OURS
+
+
+_OURS = {_words(p) for p in BACKCHANNELS + ACKS + HEARD_YOU + THINKING + STILL}
 
 
 class Fillers:
@@ -58,6 +109,9 @@ class Fillers:
     def thinking(self, first: bool) -> bytes | None:
         return self._pick(THINKING if first else STILL)
 
+    def heard_you(self) -> bytes | None:
+        return self._pick(HEARD_YOU)
+
     def _pick(self, phrases: tuple[str, ...]) -> bytes | None:
         ready = [p for p in phrases if p in self._pcm]
         fresh = [p for p in ready if p not in self._recent] or ready
@@ -73,7 +127,7 @@ class Fillers:
         d.mkdir(exist_ok=True)
         c = self._cfg
         # interleaved, so a few of each kind are ready early
-        groups = zip_longest(BACKCHANNELS, ACKS, THINKING, STILL)
+        groups = zip_longest(BACKCHANNELS, ACKS, HEARD_YOU, THINKING, STILL)
         for text in filter(None, chain.from_iterable(groups)):
             key = repr((c.engine, c.voice, c.speed, c.variant, text)).encode()
             path = d / f"{hashlib.sha256(key).hexdigest()[:16]}.pcm"
