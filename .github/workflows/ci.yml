@@ -11,9 +11,9 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+concurrency:                        # a new PR push replaces the old run; main keeps every run
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   UV_PYTHON: "3.12"                 # pjsua2 wheels exist only for 3.12
