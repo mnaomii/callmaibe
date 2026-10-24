@@ -416,8 +416,7 @@ class FakeFillers:
 @pytest.mark.parametrize(("incoming", "replies", "answered"), [
     # "I ate lasagna." pause "Okay, can you hear me?" pause "Good, push it."
     ([0.5, speech(1.0), 0.6, speech(1.0), 0.6, speech(1.0), 1.5],
-     ["I ate lasagna.", "Okay, can you hear me?", "Good, push it.",
-      "I ate lasagna. Okay, can you hear me? Good, push it."], True),
+     ["I ate lasagna.", "Okay, can you hear me?", "Good, push it."], True),
     # one phrase that ends asking: answered, and the agent still gets it all
     ([0.5, speech(2.0), 1.5], ["I ate lasagna and can you hear me?"], True),
     # the check is not at the end of the phrase: the agent answers it
@@ -432,7 +431,7 @@ def test_check_phrase_is_answered_at_once(cfg, incoming, replies, answered):
                       detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
     try:
         r = mgr.start(SHORT)
-        assert r.status is Status.IN_CALL and r.user_said == replies[-1]
+        assert r.status is Status.IN_CALL and r.user_said == " ".join(replies)   # the agent gets it all
         assert f.asked.count("heard") == (1 if answered else 0)
     finally:
         mgr.close()
@@ -448,8 +447,7 @@ def test_check_that_ends_the_turn_is_answered_before_the_full_stt(cfg):
     tel = FakeTelephony(speed=100)
     tel.script(incoming=[0.5, speech(1.0), 0.6, speech(1.0), 1.5])
     f = FakeFillers()
-    stt = SlowSTT("Something is in the oven.", "Can you hear me?",
-                  "Something is in the oven. Can you hear me?")
+    stt = SlowSTT("Something is in the oven.", "Can you hear me?")
     mgr = CallManager(tel, FakeTTS(), stt, cfg,
                       detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
     try:
@@ -495,14 +493,36 @@ def test_check_while_the_agent_works_is_answered_not_passed_on(cfg):
         mgr.close()
 
 
-def test_turn_end_reuses_stt_from_the_pause(cfg):
+@pytest.mark.parametrize("phrases", [["push it"], ["Run the tests.", "Then push it.", "Call me."]])
+def test_turn_end_reuses_stt_from_the_pauses(cfg, phrases):
     tel = FakeTelephony(speed=100)
-    tel.script(incoming=[0.5, speech(0.5), 2.0])
-    stt = FakeSTT("push it")
+    tel.script(incoming=[0.5, *[x for _ in phrases for x in (speech(1.0), 0.6)], 2.0])
+    stt = FakeSTT(*phrases)
     mgr = CallManager(tel, FakeTTS(), stt, cfg, detector_factory=lambda: FakeDetector(end_frames=50))
     try:
-        assert mgr.start(SHORT).user_said == "push it"
-        assert len(stt.heard) == 1                  # begun 0.3 s into the pause, used at 1 s
+        assert mgr.start(SHORT).user_said == " ".join(phrases)
+        # each phrase once, begun 0.3 s into the pause after it; nothing again at the turn end
+        assert len(stt.heard) == len(phrases)
+        assert sum(stt.heard) == len(speech(1.6 * len(phrases) - 0.4))   # all of it, once
+    finally:
+        mgr.close()
+
+
+def test_failed_phrase_stt_falls_back_to_the_whole_turn(cfg):
+    class FlakySTT(FakeSTT):
+        def transcribe(self, pcm):
+            if not self.heard:
+                self.heard.append(len(pcm))
+                raise RuntimeError("out of memory")
+            return super().transcribe(pcm)
+
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(1.0), 0.6, speech(1.0), 2.0])
+    stt = FlakySTT("Then push it.", "Run the tests. Then push it.")
+    mgr = CallManager(tel, FakeTTS(), stt, cfg, detector_factory=lambda: FakeDetector(end_frames=50))
+    try:
+        assert mgr.start(SHORT).user_said == "Run the tests. Then push it."
+        assert stt.heard[-1] >= len(speech(2.6))
     finally:
         mgr.close()
 
@@ -554,17 +574,19 @@ def test_backchannel_gives_time_to_go_on(cfg, go_on):
     rest = [speech(1.0), 1.5] if go_on else [2.0]
     tel = FakeTelephony(speed=100)
     tel.script(incoming=[0.5, speech(4.5), 1.2, *rest])
-    f, stt = FakeFillers(), FakeSTT(*["long story"] * 3)    # STT of each phrase, then the turn
+    f, stt = FakeFillers(), FakeSTT("long story", "and the end")     # STT of each phrase
     mgr = CallManager(tel, FakeTTS(), stt, cfg,
                       detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
     try:
         r = mgr.start(SHORT)
-        assert r.status is Status.IN_CALL and r.user_said == "long story"
+        assert r.status is Status.IN_CALL
         assert f.BC in bytes(tel.last_call.played)
         if go_on:
-            assert stt.heard[-1] >= len(speech(6.5))    # 4.5 + 1.2 pause + 1.0 + 0.2: one turn
+            assert r.user_said == "long story and the end"     # one turn
+            assert sum(stt.heard) >= len(speech(6.5))   # 4.5 + 1.2 pause + 1.0 + 0.2
             assert f.asked == ["bc", "ack"]
         else:
+            assert r.user_said == "long story"
             assert f.asked == ["bc"]                    # a "yeah" they didn't talk past: no ack
     finally:
         mgr.close()

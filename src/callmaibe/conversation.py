@@ -109,9 +109,8 @@ class _CallEnded(Exception):
 class _Peek:
     """STT of one phrase, run in the background during the pause after it."""
 
-    def __init__(self, stt: STT, pcm: bytes, at: int, whole: bool):
+    def __init__(self, stt: STT, pcm: bytes, at: int):
         self.at = at                    # frame count when it began
-        self.whole = whole              # the phrase is the whole utterance so far
         self.ok = True
         self.text = ""
         self._seen = False
@@ -144,8 +143,10 @@ class _Ear:
 
     A pause of PHRASE_PAUSE_FRAMES ends a phrase, and its STT runs in the background: a phrase
     that ends asking "can you hear me?" gets an answer at once. A longer pause after a longer
-    phrase can get a "yeah". When the detector ends the utterance, an ack plays while STT runs
-    and feed() returns the text, or "" when there is nothing to pass on (noise, "uh", a check).
+    phrase can get a "yeah". When the detector ends the utterance, an ack plays while the last
+    phrase's STT finishes, and feed() returns the phrases' texts joined, or "" when there is
+    nothing to pass on (noise, "uh", a check). So a long answer costs one phrase of STT at its
+    end, not all of it again.
     """
 
     def __init__(self, mgr: "CallManager", sess: _Session, det, barged: bool = False,
@@ -169,7 +170,7 @@ class _Ear:
         self._phrase_bytes = 0          # where the latest phrase starts in det.utterance()
         self._phrase_at = self._heard   # ...and at which frame
         self._phrase_s = 0.0            # length of the phrase that just ended
-        self._peek: _Peek | None = None
+        self._peeks: list[_Peek] = []   # one per phrase, in order
         self._next_bc = self._heard * FRAME_S + BACKCHANNEL_FIRST_S
         self._holding = False           # our "yeah" or answer plays: their pause doesn't count yet
         self._spoke_last = False        # ...and they haven't talked past it
@@ -190,13 +191,14 @@ class _Ear:
                 self._spoke_last = self._answered = False
         else:
             self._pause += 1
-        peek = self._peek
+        peek = self._peeks[-1] if self._peeks else None
         if peek is not None and peek.fresh() and c.fillers and ends_asking_if_heard(peek.text):
             mgr._answer_check(self._sess)
             self._holding = self._spoke_last = self._answered = True
         if ev is TurnEvent.SPEECH_START:
             self._started_s = now_s
             self._phrase_at = self._heard
+            self._phrase_bytes, self._peeks = 0, []     # det.utterance() starts here
             self._next_bc = now_s + BACKCHANNEL_FIRST_S
         elif ev is TurnEvent.TURN_END:
             return self._utterance_end(now_s)
@@ -216,8 +218,7 @@ class _Ear:
 
     def _phrase_end(self) -> None:
         pcm = self.det.utterance()
-        self._peek = _Peek(self._mgr._stt, pcm[self._phrase_bytes:], at=self._heard,
-                           whole=self._phrase_bytes == 0)
+        self._peeks.append(_Peek(self._mgr._stt, pcm[self._phrase_bytes:], at=self._heard))
         self._phrase_bytes = len(pcm)
         self._phrase_s = (self._voiced_at - self._phrase_at) * FRAME_S
         self._phrase_at = self._heard
@@ -231,24 +232,27 @@ class _Ear:
                  "noise floor %s, barge-in %s", sess.call_id, began, now_s, self._label,
                  len(pcm) / (SAMPLE_RATE * 2), _db(self.det), "yes" if self._barged else "no")
         t_stt = time.monotonic()
-        peek = self._peek
-        last = peek if peek is not None and peek.ok and self._voiced_at < peek.at else None
-        if last is not None:            # STT of the last phrase began in the pause: use it first
-            last.result()
-            if c.fillers and not self._answered and ends_asking_if_heard(last.text):
+        peeks = self._peeks
+        covered = bool(peeks) and self._voiced_at < peeks[-1].at
+        if covered:                     # STT of the last phrase began in the pause: use it first
+            last = peeks[-1].result()
+            if c.fillers and not self._answered and ends_asking_if_heard(last):
                 mgr._answer_check(sess)
                 self._answered = self._spoke_last = True
-        known = last is not None and last.whole
-        text = last.text if known else None
         ack = None
         if c.fillers and not (self._spoke_last or call.playing()):
             ack = mgr._fillers.ack()            # "Got it." while STT runs
             if ack:                             # (a "yeah" they didn't talk past is enough)
                 call.play(ack)
-        if text is None:
+        texts = [p.result() for p in peeks]
+        if all(p.ok for p in peeks):
+            if not covered:     # speech after the last pause: max_turn_s cut them off, or no pause
+                texts.append(mgr._stt.transcribe(pcm[self._phrase_bytes:]))
+            text = " ".join(t for t in texts if t)
+        else:
             text = mgr._stt.transcribe(pcm)
-        log.info("call %s: timing: turn end -> STT done %.2f s%s", sess.call_id,
-                 time.monotonic() - t_stt, " (begun in the pause)" if known else "")
+        log.info("call %s: timing: turn end -> STT done %.2f s (%d phrases begun in pauses)",
+                 sess.call_id, time.monotonic() - t_stt, len(peeks))
         if c.fillers and not self._answered and ends_asking_if_heard(text):
             mgr._answer_check(sess)
         if c.fillers and asks_if_heard(text):           # only the check: nothing to pass on

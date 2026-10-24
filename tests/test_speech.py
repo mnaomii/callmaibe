@@ -152,6 +152,7 @@ def test_factories_reject_unknown():
     ([" [BLANK_AUDIO]"], ""),
     ([" Okay. (upbeat music)"], "Okay."),
     ([" You"], ""),
+    ([" . ."], ""),                                 # a click or a breath
     ([" Thank you."], "Thank you."),
     ([" Phone call with a coding assistant."], ""),
     ([" No, go ahead."], "No, go ahead."),

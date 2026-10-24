@@ -34,7 +34,7 @@ def clean(segments: Iterable[str], prompt: str = "") -> str:
     text = " ".join(s for s in sentences if not _SUBTITLE.search(s))
     text = " ".join(_REPEAT.sub(r"\1", text).split())
     words = _words(text)
-    if words == " you " or (words.count(" ") > 4 and words in _words(prompt)):  # noise, prompt echo
+    if words in ("  ", " you ") or (words.count(" ") > 4 and words in _words(prompt)):  # noise, echo
         return ""
     return text
 
