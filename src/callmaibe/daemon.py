@@ -18,7 +18,6 @@ from .status import Status, TurnResult
 
 log = logging.getLogger("callmaibe.daemon")
 
-_ENDED = {Status.ENDED, Status.ENDED_BY_USER}
 _UP = {Status.IN_CALL, Status.NO_REPLY}
 _KEEP_PERMIT = {Status.NO_ANSWER, Status.BUSY, Status.LINE_BUSY, Status.ERROR, Status.UNAVAILABLE}
 
@@ -67,7 +66,7 @@ def make_server(cfg: Config, manager: Any, policy: Policy,
             res = manager.end(call_id, body.get("message"))
         else:
             res = manager.say(call_id, body["message"], bool(body.get("expect_reply", True)))
-        if Status(res.status) in _ENDED or ending:
+        if Status(res.status) not in _UP:     # an interrupted goodbye keeps the call up
             drop_owner(call_id)
         return res.to_dict()
 

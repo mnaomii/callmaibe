@@ -20,6 +20,8 @@ Otherwise do not call. Do not call for small updates.
    Then ask ONE question.
 2. Listen to `user_said`, then reply with `call_say`. One question at a time.
 3. Finish with `call_end` and a short goodbye. Always end calls you started.
+   If `call_end` returns `in_call`, the person added something during or right after your
+   goodbye. The call is still up: answer `user_said` with `call_say`, then end again.
 
 ## How to speak
 

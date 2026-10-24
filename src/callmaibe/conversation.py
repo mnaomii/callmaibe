@@ -5,7 +5,7 @@ Interface used by the daemon:
     mgr = CallManager(telephony, tts, stt, cfg)
     mgr.start(message, topic=None) -> TurnResult     # dial, ring, speak, listen
     mgr.say(call_id, message, expect_reply=True) -> TurnResult
-    mgr.end(call_id, message=None) -> TurnResult
+    mgr.end(call_id, message=None) -> TurnResult     # IN_CALL if they talk over or after the goodbye
     mgr.active() -> dict | None                      # {"call_id", "state", "started_at", "turns"}
     mgr.close()
 
@@ -47,6 +47,7 @@ GOODBYE_IDLE = "I have to go now. I'll write the rest in the terminal."
 CUE_INTERVAL_S = 4.0
 FIRST_CUE_S = 1.0
 BARGE_GRACE_S = 0.4          # ignore the first moment of our own playback (line echo); later turns
+LAST_WORDS_S = 2.0           # after a goodbye, wait this long for "wait, one more thing" before hanging up
 READ_POLL_S = 0.05
 
 _RING_END = {
@@ -154,11 +155,8 @@ class CallManager:
                 return early
             try:
                 if message:
-                    sess.note("Agent", message)
-                    self._speak(sess, message, barge=False)
+                    return self._turn(sess, message, expect_reply=False, ending=True)
                 return self._finish(sess, TurnResult(Status.ENDED, call_id=sess.call_id))
-            except _CallEnded:
-                return self._finish(sess, TurnResult(Status.ENDED_BY_USER, call_id=sess.call_id))
             except Exception as e:  # noqa: BLE001 - any failure becomes ERROR
                 return self._fail(sess, e)
 
@@ -247,31 +245,37 @@ class CallManager:
                             transcript=sess.answered_mono > 0)
 
     # ------------------------------------------------------------------ one turn
-    def _turn(self, sess: _Session, message: str, expect_reply: bool) -> TurnResult:
+    def _turn(self, sess: _Session, message: str, expect_reply: bool,
+              ending: bool = False) -> TurnResult:
+        """Speak `message`, then listen. The person can talk over any message; after a goodbye
+        (`ending`) they also get LAST_WORDS_S to start talking. Either way the call stays up."""
         call = sess.call
+        c = self._cfg.conversation
         sess.turns += 1
         sess.note("Agent", message)
-        det = self._detector_factory() if expect_reply else None
+        det = self._detector_factory()
         try:
-            c = self._cfg.conversation
             grace = c.first_turn_grace_s if sess.turns == 1 else BARGE_GRACE_S
-            barge = expect_reply and c.barge_in and call.full_duplex
+            barge = c.barge_in and call.full_duplex
             barged = self._speak(sess, message, barge=barge, det=det, grace_s=grace)
             if barged:
                 sess.lines[-1] = (*sess.lines[-1][:2], message + " [interrupted]")
-            if not expect_reply:
-                return self._between_turns(sess, TurnResult(Status.IN_CALL, call_id=sess.call_id))
-            text = self._listen(sess, det, speech_started=barged)
+            wait_s = c.listen_timeout_s if expect_reply else LAST_WORDS_S if ending else 0.0
+            talking = barged or det.in_speech
+            text = self._listen(sess, det, talking, wait_s) if talking or wait_s else None
         except _CallEnded as e:
             text = e.args[0] if e.args else ""
             sess.note("You", text)
             return self._finish(sess, TurnResult(Status.ENDED_BY_USER, user_said=text,
                                                  call_id=sess.call_id))
-        if text is None:
-            return self._between_turns(sess, TurnResult(Status.NO_REPLY, call_id=sess.call_id))
-        sess.note("You", text)
-        return self._between_turns(sess, TurnResult(Status.IN_CALL, user_said=text,
-                                                    call_id=sess.call_id))
+        if text is not None:
+            sess.note("You", text)
+            return self._between_turns(sess, TurnResult(Status.IN_CALL, user_said=text,
+                                                        call_id=sess.call_id))
+        if ending:
+            return self._finish(sess, TurnResult(Status.ENDED, call_id=sess.call_id))
+        status = Status.NO_REPLY if expect_reply else Status.IN_CALL
+        return self._between_turns(sess, TurnResult(status, call_id=sess.call_id))
 
     def _speak(self, sess: _Session, text: str, barge: bool, det=None,
                grace_s: float = BARGE_GRACE_S) -> bool:
@@ -344,8 +348,8 @@ class CallManager:
         finally:
             cancel.set()
 
-    def _listen(self, sess: _Session, det, speech_started: bool) -> str | None:
-        """Listen until TURN_END; return the transcript, or None if nobody spoke in time."""
+    def _listen(self, sess: _Session, det, speech_started: bool, wait_s: float) -> str | None:
+        """Listen until TURN_END; return the transcript, or None if nobody started within wait_s."""
         call = sess.call
         c = self._cfg.conversation
         barged = speech_started
@@ -384,9 +388,9 @@ class CallManager:
                     continue
             # frames arrive in real time on a real line; the frame count also keeps fast fakes honest
             elapsed = max(time.monotonic() - t0, frames * FRAME_S)
-            if not speech_started and elapsed >= c.listen_timeout_s:
+            if not speech_started and elapsed >= wait_s:
                 return None
-            if speech_started and elapsed >= c.listen_timeout_s + c.max_turn_s + 5:
+            if speech_started and elapsed >= wait_s + c.max_turn_s + 5:
                 log.warning("call %s: detector never ended the turn; forcing it", sess.call_id)
                 return self._stt.transcribe(det.utterance())
 

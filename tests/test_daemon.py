@@ -143,6 +143,17 @@ def test_session_mismatch(env):
     assert call("POST", "/call/say", {**body, "session": "s"})[1]["status"] == "not_found"
 
 
+def test_interrupted_goodbye_keeps_the_call(env):
+    call, mgr, policy = env
+    policy.enable_session("s", True)
+    call("POST", "/call/start", {"session": "s", "message": "a"})
+    body = {"session": "s", "call_id": "c1", "message": "bye"}
+    mgr.end = lambda call_id, message=None: TurnResult(Status.IN_CALL, user_said="wait",
+                                                       call_id=call_id)
+    assert call("POST", "/call/end", body)[1]["user_said"] == "wait"
+    assert call("POST", "/call/say", body)[1]["status"] == "in_call"
+
+
 def test_bad_request(env):
     call, _, _ = env
     assert call("POST", "/call/start", {"session": "s"})[0] == 400

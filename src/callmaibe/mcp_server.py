@@ -62,13 +62,17 @@ async def call_start(message: str, ctx: Context, topic: str | None = None) -> di
 
 
 @mcp.tool(description="Speak `message` on the active call and (if expect_reply) wait for the "
-          f"person's answer. Needs the call_id from call_start. {STYLE}\n{STATUSES}")
+          "person's answer. Needs the call_id from call_start. Even with expect_reply false "
+          "they can talk over you; then `user_said` holds what they said, so answer it. "
+          f"{STYLE}\n{STATUSES}")
 async def call_say(call_id: str, message: str, ctx: Context, expect_reply: bool = True) -> dict:
     return await _run(ctx, lambda c: c.say(session_key(), call_id, message, expect_reply))
 
 
 @mcp.tool(description="Say an optional short goodbye and hang up the call. Always end calls "
-          f"you started.\n{STATUSES}")
+          "you started. If the person talks over the goodbye or right after it, the call stays "
+          "up and the status is in_call with what they said: answer with call_say, then call "
+          f"call_end again.\n{STATUSES}")
 async def call_end(call_id: str, ctx: Context, message: str | None = None) -> dict:
     return await _run(ctx, lambda c: c.end(session_key(), call_id, message))
 

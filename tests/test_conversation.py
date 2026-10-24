@@ -314,6 +314,46 @@ def test_end_writes_transcript(make):
     assert r.call_id in r2.transcript_path
 
 
+@pytest.mark.parametrize("final", ["end", "say"])
+def test_talking_over_a_statement_keeps_the_call_up(make, final):
+    mgr, tel, _ = make("ok", "one more thing", speed=20,
+                       incoming=[0.5, speech(0.3), 0.8, speech(2.0), 1.0])
+    r = mgr.start(SHORT)
+    if final == "end":
+        r2 = mgr.end(r.call_id, LONG)
+    else:
+        r2 = mgr.say(r.call_id, LONG, expect_reply=False)
+    assert r2.status is Status.IN_CALL and r2.user_said == "one more thing"
+    call = tel.last_call
+    assert call.state is CallState.ACTIVE and mgr.active() is not None
+    assert len(call.played) < call.queued_bytes        # the statement was cut short
+    r3 = mgr.end(r.call_id, "Got it. Bye.")
+    assert r3.status is Status.ENDED
+    text = Path(r3.transcript_path).read_text(encoding="utf-8")
+    assert "[interrupted]" in text and "You: one more thing" in text
+
+
+def test_end_listens_briefly_after_goodbye(make):
+    mgr, tel, _ = make("ok", "wait, one more thing", speed=20,
+                       incoming=[0.5, speech(0.3), 1.5, speech(0.6), 1.0])
+    r = mgr.start(SHORT)
+    r2 = mgr.end(r.call_id, "Bye now.")
+    assert r2.status is Status.IN_CALL and r2.user_said == "wait, one more thing"
+    assert tel.last_call.state is CallState.ACTIVE
+    assert tel.last_call.stop_count == 0               # the goodbye played in full
+    assert mgr.end(r.call_id, "Okay. Bye.").status is Status.ENDED
+
+
+def test_end_hangs_up_after_silent_goodbye_window(make):
+    mgr, tel, stt = make("ok", incoming=[0.5, speech(0.3)])
+    r = mgr.start(SHORT)
+    assert mgr.end(r.call_id, "Bye now.").status is Status.ENDED
+    call = tel.last_call
+    assert call.state is CallState.ENDED
+    assert call.virtual_s >= 1.0 + conversation.LAST_WORDS_S   # first reply ended at ~1 s
+    assert len(stt.heard) == 1
+
+
 def test_thinking_cue_between_turns(make, cfg, monkeypatch):
     monkeypatch.setattr(conversation, "FIRST_CUE_S", 0.0)
     cfg.conversation.thinking_cue = True
