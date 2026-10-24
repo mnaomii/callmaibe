@@ -15,7 +15,7 @@ You:   Yes.
 Agent: Great. I'll start now and write the result in the terminal. Bye.
 ```
 
-Status: early. Real SIP calls are not yet verified end to end, see [Project status](#project-status-and-roadmap).
+Status: early, but real calls work: tested over Wi-Fi and mobile data, see [Project status](#project-status-and-roadmap).
 
 ## How it works
 
@@ -353,12 +353,12 @@ Licenses are those the upstream projects state; check them before redistributing
 
 Where this stands:
 
-- Built and unit-tested with mocks: policy (switches, snooze, quiet hours), the daemon API, the conversation engine against a fake telephony backend, the local mic/speaker backend, the speech pipeline, the CLI, the `/call` hook, and the setup wizard.
-- Not yet verified end to end: real SIP calls from the pjsua2 backend to the Linphone app. That includes push wake-up with the app closed, SRTP against the app's mandatory-encryption default, and NAT on mobile data (whether sip.linphone.org relays media for free accounts is not confirmed).
+- Verified on real calls (Linphone app, daemon in WSL2): SIP over TLS with SRTP media, push wake-up with the app closed, Wi-Fi and mobile data with audio relayed by sip.linphone.org on free accounts, multi-turn conversation with barge-in.
+- Built and unit-tested with mocks, in CI on Linux, Windows and macOS: policy (switches, snooze, quiet hours), the daemon API, the conversation engine against a fake telephony backend, the local mic/speaker backend, the speech pipeline, the CLI, the `/call` hook, and the setup wizard. The pjsua2 backend is also tested with local loopback calls on Linux.
 - Not tested: the macOS SIP wheel, and the installers have only been dry-run (`install.ps1 -DryRun`, `bash -n` on `install.sh`).
 - Known limits: the Linux pjsua2 wheel bundles OpenSSL 1.0.2 (end of life) and has no Opus; SIP needs Python 3.12.
 
-Roadmap: finish the real-call verification, barge-in and sentence-streamed TTS polish, PyPI release, our own pjsua2 wheels (OpenSSL 3, Opus), inbound calls, PSTN through a SIP trunk, SIP MESSAGE commands, other agents. See [docs/PLAN.md](docs/PLAN.md).
+Roadmap: barge-in and sentence-streamed TTS polish, PyPI release, our own pjsua2 wheels (OpenSSL 3, Opus), inbound calls, PSTN through a SIP trunk, SIP MESSAGE commands, other agents. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Contributing
 
