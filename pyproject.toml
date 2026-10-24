@@ -42,6 +42,7 @@ line-length = 100
 testpaths = ["tests"]
 markers = [
     "slow: downloads models or runs real speech engines",
-    "sip: needs pjsua2 (Linux) and network",
+    "sip: needs pjsua2 (Linux)",
+    "network: talks to sip.linphone.org",
 ]
 addopts = "-m 'not slow and not sip'"

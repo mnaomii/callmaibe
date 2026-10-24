@@ -1,5 +1,7 @@
 # callmaibe
 
+[![CI](https://github.com/mnaomii/callmaibe/actions/workflows/ci.yml/badge.svg)](https://github.com/mnaomii/callmaibe/actions/workflows/ci.yml)
+
 Let your AI coding agent phone you. When it finishes a long task or gets stuck, it calls your phone over SIP, tells you what it did and what it weighed up, and has a spoken back-and-forth with you. Everything you say comes back to the agent as text, so it can act on it. Calls only happen while you have switched them on.
 
 Example call (the agent speaks first):
@@ -356,19 +358,20 @@ Where this stands:
 - Not tested: the macOS SIP wheel, and the installers have only been dry-run (`install.ps1 -DryRun`, `bash -n` on `install.sh`).
 - Known limits: the Linux pjsua2 wheel bundles OpenSSL 1.0.2 (end of life) and has no Opus; SIP needs Python 3.12.
 
-Roadmap: finish the real-call verification, barge-in and sentence-streamed TTS polish, CI on three OSes, PyPI release, our own pjsua2 wheels (OpenSSL 3, Opus), inbound calls, PSTN through a SIP trunk, SIP MESSAGE commands, other agents. See [docs/PLAN.md](docs/PLAN.md).
+Roadmap: finish the real-call verification, barge-in and sentence-streamed TTS polish, PyPI release, our own pjsua2 wheels (OpenSSL 3, Opus), inbound calls, PSTN through a SIP trunk, SIP MESSAGE commands, other agents. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Contributing
 
 ```bash
-uv sync
-uv run pytest                  # default run skips the markers below
-uv run pytest -m slow          # downloads models, runs real speech engines
-uv run pytest -m sip           # needs pjsua2 (Linux) and network
+uv sync --extra speech          # Linux: add --extra sip for the sip tests
+uv run pytest                   # default run skips the markers below
+uv run pytest -m slow           # downloads models, runs real speech engines
+uv run pytest -m sip            # needs pjsua2 (Linux); local loopback calls only
+uv run pytest -m network        # registers against sip.linphone.org
 uv run ruff check
 ```
 
-Telephony is mocked in the default tests. Do not put credentials in the repo. Architecture and decisions: [docs/PLAN.md](docs/PLAN.md); daemon API: [docs/API.md](docs/API.md).
+Telephony is mocked in the default tests. CI (`.github/workflows/ci.yml`) runs lint and the default tests on Linux, Windows and macOS, and the sip tests on Linux, for every push and pull request; the slow and network tests run every Monday and on demand. Do not put credentials in the repo. Architecture and decisions: [docs/PLAN.md](docs/PLAN.md); daemon API: [docs/API.md](docs/API.md).
 
 ## License
 

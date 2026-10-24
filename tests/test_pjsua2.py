@@ -1,6 +1,6 @@
 """pjsua2 backend on Linux/WSL. Run with: pytest -m sip tests/test_pjsua2.py
 
-Needs the pjsua2-python wheel and network access to sip.linphone.org.
+Needs the pjsua2-python wheel. The test marked `network` also needs sip.linphone.org.
 """
 
 import math
@@ -46,6 +46,7 @@ def test_start_stop_twice_without_account(home):
     assert (paths.logs_dir() / "pjsip.log").exists()
 
 
+@pytest.mark.network
 def test_tls_registration_with_fake_credentials_is_rejected(home, monkeypatch):
     monkeypatch.setenv("CALLMAIBE_SIP_PASSWORD", "definitely-wrong")
     cfg = Config()

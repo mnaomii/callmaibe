@@ -498,6 +498,9 @@ class Pjsua2Telephony(Telephony):
         ep.libStart()
         self._set_codecs()
         log.info("pjsua2 %s started (%s transport)", ep.libVersion().full, transport)
+        # The password lookup below can leave keyring holding a traceback that reaches this
+        # frame. Without the local, a leaked Endpoint can't make the next pj.Endpoint() abort.
+        del ep
 
         if cfg.account.uri:
             self._create_account(tid, transport)
