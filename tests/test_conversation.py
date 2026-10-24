@@ -82,6 +82,9 @@ class FakeDetector:
     def utterance(self):
         return bytes(self.buf)
 
+    def hold(self):
+        self.silent = 0
+
 
 def wait_for(pred, timeout=3.0):
     end = time.monotonic() + timeout
@@ -361,24 +364,14 @@ def test_talking_over_a_statement_keeps_the_call_up(make, final):
     assert "[interrupted]" in text and "You: one more thing" in text
 
 
-def test_end_listens_briefly_after_goodbye(make):
-    mgr, tel, _ = make("ok", "wait, one more thing", speed=20,
-                       incoming=[0.5, speech(0.3), 1.5, speech(0.6), 1.0])
-    r = mgr.start(SHORT)
-    r2 = mgr.end(r.call_id, "Bye now.")
-    assert r2.status is Status.IN_CALL and r2.user_said == "wait, one more thing"
-    assert tel.last_call.state is CallState.ACTIVE
-    assert tel.last_call.stop_count == 0               # the goodbye played in full
-    assert mgr.end(r.call_id, "Okay. Bye.").status is Status.ENDED
-
-
-def test_end_hangs_up_after_silent_goodbye_window(make):
-    mgr, tel, stt = make("ok", incoming=[0.5, speech(0.3)])
+def test_end_hangs_up_right_after_the_goodbye(make):
+    mgr, tel, stt = make("ok", "too late", speed=20,
+                         incoming=[0.5, speech(0.3), 1.5, speech(0.6), 1.0])
     r = mgr.start(SHORT)
     assert mgr.end(r.call_id, "Bye now.").status is Status.ENDED
     call = tel.last_call
-    assert call.state is CallState.ENDED
-    assert call.virtual_s >= 1.0 + conversation.LAST_WORDS_S   # first reply ended at ~1 s
+    assert call.state is CallState.ENDED and call.stop_count == 0   # the goodbye played in full
+    assert call.virtual_s < 2.3                    # hung up before they spoke again at 2.3 s
     assert len(stt.heard) == 1
 
 
@@ -391,3 +384,71 @@ def test_thinking_cue_between_turns(make, cfg, monkeypatch):
     assert r.status is Status.IN_CALL
     assert wait_for(lambda: cue in bytes(tel.last_call.played))
     assert mgr.end(r.call_id).status is Status.ENDED
+
+
+class FakeFillers:
+    BC = b"\x04\x00" * 12800           # 0.8 s, like a real "yeah"
+    ACK = b"\x05\x00" * 1600
+    THINK = b"\x06\x00" * 1600
+
+    def __init__(self):
+        self.asked = []
+
+    def backchannel(self):
+        self.asked.append("bc")
+        return self.BC
+
+    def ack(self):
+        self.asked.append("ack")
+        return self.ACK
+
+    def thinking(self, first):
+        self.asked.append("first" if first else "still")
+        return self.THINK
+
+
+def test_fillers_ack_then_think_while_the_agent_works(cfg, monkeypatch):
+    monkeypatch.setattr(conversation, "FIRST_CUE_S", 0.0)
+    cfg.conversation.thinking_cue = True
+    cue = b"\x07\x00" * 320
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(0.3)])
+    f = FakeFillers()
+    mgr = CallManager(tel, FakeTTS(), FakeSTT("ok"), cfg, detector_factory=FakeDetector,
+                      cue=lambda: cue, cue_interval_s=0.05, fillers=f)
+    try:
+        r = mgr.start(SHORT)
+        assert r.status is Status.IN_CALL
+        # ack while STT runs; then filler, cue sound, "still" filler while the agent works
+        assert wait_for(lambda: f.asked[:3] == ["ack", "first", "still"]), f.asked
+        assert wait_for(lambda: all(x in bytes(tel.last_call.played) for x in (f.ACK, f.THINK, cue)))
+        # after a statement nobody answered, there is no "let me check" to say
+        assert mgr.say(r.call_id, "Running the tests now.", expect_reply=False).status is Status.IN_CALL
+        n = len(f.asked)
+        assert wait_for(lambda: len(f.asked) > n + 1)
+        assert f.asked.count("first") == 1
+    finally:
+        mgr.close()
+
+
+@pytest.mark.parametrize("go_on", [True, False])
+def test_backchannel_gives_time_to_go_on(cfg, go_on):
+    # 1 s of silence ends the turn. They pause 1.2 s after 4.5 s of talking: a "yeah" plays
+    # 0.4 s in, and the silence count restarts after it, so going on keeps it one turn.
+    rest = [speech(1.0), 1.5] if go_on else [2.0]
+    tel = FakeTelephony(speed=100)
+    tel.script(incoming=[0.5, speech(4.5), 1.2, *rest])
+    f, stt = FakeFillers(), FakeSTT("long story")
+    mgr = CallManager(tel, FakeTTS(), stt, cfg,
+                      detector_factory=lambda: FakeDetector(end_frames=50), fillers=f)
+    try:
+        r = mgr.start(SHORT)
+        assert r.status is Status.IN_CALL and r.user_said == "long story"
+        assert f.BC in bytes(tel.last_call.played)
+        if go_on:
+            assert stt.heard[0] >= len(speech(7.5))     # 4.5 + 1.2 pause + 1.0 + 1.0: one turn
+            assert f.asked == ["bc", "ack"]
+        else:
+            assert f.asked == ["bc"]                    # a "yeah" they didn't talk past: no ack
+    finally:
+        mgr.close()

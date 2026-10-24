@@ -5,7 +5,7 @@ Interface used by the daemon:
     mgr = CallManager(telephony, tts, stt, cfg)
     mgr.start(message, topic=None) -> TurnResult     # dial, ring, speak, listen
     mgr.say(call_id, message, expect_reply=True) -> TurnResult
-    mgr.end(call_id, message=None) -> TurnResult     # IN_CALL if they talk over or after the goodbye
+    mgr.end(call_id, message=None) -> TurnResult     # IN_CALL if they talk over the goodbye
     mgr.active() -> dict | None                      # {"call_id", "state", "started_at", "turns"}
     mgr.close()
 
@@ -15,12 +15,15 @@ Status.LINE_BUSY). Policy is NOT checked here; the daemon does that first.
 
 One turn = speak + listen. TTS sentences are queued on the call as soon as
 each is synthesized (a producer thread), while this thread keeps reading
-incoming frames into a TurnDetector so the user can barge in. Between turns a
-background thread plays the thinking cue, drains incoming audio, notices a
-remote hangup and enforces idle_hangup_s / max_call_min.
+incoming frames into a TurnDetector so the user can barge in. When the user
+pauses mid-turn, a short "yeah" can play; when they stop, a spoken ack plays
+while STT runs. Between turns a
+background thread plays thinking fillers and the cue sound, drains incoming
+audio, notices a remote hangup and enforces idle_hangup_s / max_call_min.
 """
 
 import logging
+import random
 import threading
 import time
 import uuid
@@ -35,6 +38,7 @@ from . import paths
 from .audio import FRAME_MS, SAMPLE_RATE
 from .audio.vad import TurnEvent
 from .config import Config
+from .fillers import Fillers
 from .status import Status, TurnResult
 from .stt.base import STT
 from .telephony.base import Call, CallState, EndReason, Telephony
@@ -44,11 +48,15 @@ log = logging.getLogger(__name__)
 
 FRAME_S = FRAME_MS / 1000
 GOODBYE_IDLE = "I have to go now. I'll write the rest in the terminal."
-CUE_INTERVAL_S = 4.0
-FIRST_CUE_S = 1.0
+CUE_INTERVAL_S = 4.0         # between-turns sounds: a spoken filler, then the cue sound, and so on
+FIRST_CUE_S = 1.5            # most agent replies take 3-6 s; a quicker one needs no filler
 BARGE_GRACE_S = 0.4          # ignore the first moment of our own playback (line echo); later turns
-LAST_WORDS_S = 2.0           # after a goodbye, wait this long for "wait, one more thing" before hanging up
 READ_POLL_S = 0.05
+# A "yeah" in a pause while the user talks. Their turn ends after end_silence_ms of silence,
+# so a shorter pause is a breath, a good moment to show we're listening.
+BACKCHANNEL_PAUSE_MS = 400
+BACKCHANNEL_FIRST_S = 4.0    # talking this long earns the first one; short replies get none
+BACKCHANNEL_GAP_S = (5.0, 8.0)   # then a random wait in this range between them
 
 _RING_END = {
     EndReason.DECLINED: Status.DECLINED,
@@ -98,12 +106,14 @@ class CallManager:
         detector_factory: Callable[[], object] | None = None,
         cue: Callable[[], bytes] | None = None,
         cue_interval_s: float = CUE_INTERVAL_S,
+        fillers: Fillers | None = None,
     ):
         self._tel = telephony
         self._tts = tts
         self._stt = stt
         self._cfg = cfg
         self._detector_factory = detector_factory or self._default_detector
+        self._fillers = fillers or Fillers(tts, cfg.tts)
         self._cue_fn = cue
         self._cue_pcm: bytes | None = None
         self._cue_interval = cue_interval_s
@@ -171,6 +181,11 @@ class CallManager:
                 "started_at": sess.started_at.isoformat(timespec="seconds"),
                 "turns": sess.turns,
             }
+
+    def warmup(self) -> None:
+        """Prepare the spoken fillers: slow the first time, so call it from a background thread."""
+        if self._cfg.conversation.fillers:
+            self._fillers.render(busy=lambda: self._active is not None)
 
     def close(self) -> None:
         with self._lock:
@@ -247,8 +262,8 @@ class CallManager:
     # ------------------------------------------------------------------ one turn
     def _turn(self, sess: _Session, message: str, expect_reply: bool,
               ending: bool = False) -> TurnResult:
-        """Speak `message`, then listen. The person can talk over any message; after a goodbye
-        (`ending`) they also get LAST_WORDS_S to start talking. Either way the call stays up."""
+        """Speak `message`, then listen. The person can talk over any message, a goodbye
+        (`ending`) too; then the call stays up. After a goodbye in full we hang up at once."""
         call = sess.call
         c = self._cfg.conversation
         sess.turns += 1
@@ -260,7 +275,7 @@ class CallManager:
             barged = self._speak(sess, message, barge=barge, det=det, grace_s=grace)
             if barged:
                 sess.lines[-1] = (*sess.lines[-1][:2], message + " [interrupted]")
-            wait_s = c.listen_timeout_s if expect_reply else LAST_WORDS_S if ending else 0.0
+            wait_s = c.listen_timeout_s if expect_reply else 0.0
             talking = barged or det.in_speech
             text = self._listen(sess, det, talking, wait_s) if talking or wait_s else None
         except _CallEnded as e:
@@ -358,6 +373,9 @@ class CallManager:
         t0, frames = time.monotonic(), 0
         listen_start = t0
         started_at = 0.0 if speech_started else None     # relative to listen start
+        heard = pause = 0               # frames read (the call's clock), unvoiced frames in a row
+        next_bc = BACKCHANNEL_FIRST_S   # in seconds of that clock
+        holding = bc_unanswered = False
         while True:
             frame = self._read(sess, READ_POLL_S * 2)
             if frame is None:
@@ -365,10 +383,26 @@ class CallManager:
                     raise _CallEnded(self._partial(det) if speech_started else "")
             else:
                 frames += 1
+                heard += 1
+                now_s = heard * FRAME_S
+                holding = holding and call.playing()
+                if holding:
+                    det.hold()          # our "yeah" is playing: their pause doesn't count yet
                 ev = det.feed(frame)
+                pause = 0 if det.last_voiced else pause + 1
+                if det.last_voiced and not holding:
+                    bc_unanswered = False
                 if ev is TurnEvent.SPEECH_START:
                     speech_started = True
                     started_at = time.monotonic() - listen_start
+                    next_bc = now_s + BACKCHANNEL_FIRST_S
+                elif (ev is TurnEvent.NONE and speech_started and c.fillers and now_s >= next_bc
+                      and pause * FRAME_MS >= BACKCHANNEL_PAUSE_MS and not call.playing()):
+                    if bc := self._fillers.backchannel():          # "yeah" while they talk
+                        call.play(bc)
+                        holding = bc_unanswered = True
+                        log.info("call %s: backchannel %.1f s into the turn", sess.call_id, now_s)
+                    next_bc = now_s + random.uniform(*BACKCHANNEL_GAP_S)
                 elif ev is TurnEvent.TURN_END:
                     pcm = det.utterance()
                     began = "?" if started_at is None else f"{started_at:.2f}"
@@ -377,6 +411,11 @@ class CallManager:
                              sess.call_id, began,
                              time.monotonic() - listen_start, len(pcm) / (SAMPLE_RATE * 2),
                              _db(det), "yes" if barged else "no")
+                    # a "yeah" they didn't talk past is ack enough
+                    ack = (self._fillers.ack() if c.fillers and not call.playing()
+                           and not bc_unanswered else None)
+                    if ack:                                  # "Got it." while STT runs
+                        call.play(ack)
                     t_stt = time.monotonic()
                     text = self._stt.transcribe(pcm)
                     log.info("call %s: timing: turn end -> STT done %.2f s",
@@ -384,6 +423,8 @@ class CallManager:
                     if text:
                         return text
                     log.info("call %s: empty transcription, still listening", sess.call_id)
+                    if ack:
+                        call.stop_playback()
                     det.reset()
                     speech_started = False
                     t0, frames = time.monotonic(), 0
@@ -423,7 +464,8 @@ class CallManager:
     # ------------------------------------------------------------------ between turns
     def _between_turns(self, sess: _Session, result: TurnResult) -> TurnResult:
         sess.idle_stop = threading.Event()
-        sess.idle_thread = threading.Thread(target=self._idle, args=(sess, sess.idle_stop),
+        sess.idle_thread = threading.Thread(target=self._idle,
+                                            args=(sess, sess.idle_stop, bool(result.user_said)),
                                             name="callmaibe-idle", daemon=True)
         sess.idle_thread.start()
         return result
@@ -450,14 +492,23 @@ class CallManager:
                 self._cue_pcm = b""
         return self._cue_pcm or None
 
-    def _idle(self, sess: _Session, stop: threading.Event) -> None:
+    def _idle_sound(self, slot: int, heard: bool) -> bytes | None:
+        """Even slots speak a filler: first "Let me check." (only after the user spoke), then
+        "Still on it." ones. Other slots, and any without a filler ready, play the cue sound."""
+        if slot % 2 == 0 and self._cfg.conversation.fillers and (heard or slot > 0):
+            pcm = self._fillers.thinking(first=slot == 0 and heard)
+            if pcm:
+                return pcm
+        return self._cue()
+
+    def _idle(self, sess: _Session, stop: threading.Event, heard: bool = False) -> None:
         call = sess.call
         c = self._cfg.conversation
         start = time.monotonic()
         idle_deadline = start + c.idle_hangup_s
         max_deadline = sess.answered_mono + c.max_call_min * 60
         next_cue = start + FIRST_CUE_S
-        cue = self._cue()
+        slot = 0
         try:
             while not stop.is_set():
                 self._read(sess, READ_POLL_S * 2)    # drain and discard
@@ -481,12 +532,13 @@ class CallManager:
                     self._remember(sess, TurnResult(Status.ENDED, call_id=sess.call_id,
                                                     reason=reason))
                     return
-                if cue and now >= next_cue:
-                    if not call.playing():
-                        call.play(cue)
+                if now >= next_cue and not call.playing():     # wait for the ack to finish
+                    if pcm := self._idle_sound(slot, heard):
+                        call.play(pcm)
+                    slot += 1
                     next_cue = now + self._cue_interval
-            if call.playing():                        # cut a cue short; the agent speaks now
-                call.stop_playback()
+            # A filler still playing finishes: cut mid-word it sounds broken, and the agent's
+            # first sentence takes about as long to synthesize anyway.
         except Exception as e:
             log.exception("call %s: error between turns", sess.call_id)
             self._remember(sess, TurnResult(Status.ERROR, call_id=sess.call_id,

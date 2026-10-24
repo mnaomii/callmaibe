@@ -85,6 +85,10 @@ class TurnDetector:
             return TurnEvent.TURN_END
         return TurnEvent.NONE
 
+    def hold(self) -> None:
+        """Restart the end-of-turn silence count: while we say "yeah", their pause isn't over."""
+        self._silence = 0
+
     @property
     def in_speech(self) -> bool:
         return self._started and not self._done

@@ -12,6 +12,7 @@ from callmaibe.tts.kokoro import split_sentences
 
 VOICED = b"\x01" * FRAME_BYTES
 SILENT = b"\x00" * FRAME_BYTES
+PROMPT = "Phone call with a coding assistant. Yes, no, go ahead, wait."
 
 
 def make_detector(monkeypatch, **kw) -> TurnDetector:
@@ -158,7 +159,7 @@ def test_factories_reject_unknown():
 def test_whisper_cleanup(segments, expected):
     from callmaibe.stt.faster_whisper import clean
 
-    assert clean(segments, STTCfg().prompt) == expected
+    assert clean(segments, PROMPT) == expected
 
 
 def test_whisper_decodes_once_with_a_token_budget():
@@ -173,12 +174,12 @@ def test_whisper_decodes_once_with_a_token_budget():
             calls.append(kw)
             return iter([SimpleNamespace(text=" Sounds good.")]), None
 
-    stt = FasterWhisperSTT(STTCfg())
+    stt = FasterWhisperSTT(STTCfg(prompt=PROMPT))
     stt._model = Model()
     assert stt.transcribe(bytes(2 * SAMPLE_RATE * 2)) == "Sounds good."
     stt.transcribe(bytes(10 * SAMPLE_RATE * 2))
     short, long = calls
-    assert short["temperature"] == 0 and short["initial_prompt"] == STTCfg().prompt
+    assert short["temperature"] == 0 and short["initial_prompt"] == PROMPT
     assert 20 <= short["max_new_tokens"] < long["max_new_tokens"] <= 100
 
 

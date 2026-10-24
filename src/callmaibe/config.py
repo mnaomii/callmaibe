@@ -63,8 +63,9 @@ class STTCfg:
     language: str = "en"
     device: str = "auto"                            # auto | cpu | cuda
     compute_type: str = "int8"
-    # Tells Whisper what to expect: helps with short replies and jargon. "" turns it off.
-    prompt: str = "Phone call with a coding assistant. Yes, no, go ahead, wait."
+    # Words Whisper should expect, e.g. project names. Off by default: Whisper can tack
+    # prompt words onto what you said ("...try that. Assistant.").
+    prompt: str = ""
 
 
 @dataclass
@@ -76,6 +77,7 @@ class ConversationCfg:
     idle_hangup_s: float = 120                      # agent silent this long between turns -> hang up
     max_call_min: float = 20
     thinking_cue: bool = True
+    fillers: bool = True                            # "Got it." when you stop, "Let me check." while it works
     keep_transcripts: bool = True
     barge_in: bool = True                           # let you interrupt the agent while it speaks
     barge_in_min_ms: int = 700                      # sustained speech needed to interrupt

@@ -24,7 +24,8 @@ STATUSES = """Result has `status`:
 - not_found, error: stop calling and write the summary in the terminal."""
 
 STYLE = ("Phone style: short plain sentences, one question at a time, no markdown, code, "
-         "file paths or URLs; say numbers naturally.")
+         "file paths or URLs; say numbers naturally. The phone already says fillers like "
+         "'got it' and 'let me check' while you work, so start with the answer.")
 
 mcp = FastMCP("callmaibe", instructions="Phone the user over a real call. " + STYLE)
 
@@ -70,7 +71,7 @@ async def call_say(call_id: str, message: str, ctx: Context, expect_reply: bool 
 
 
 @mcp.tool(description="Say an optional short goodbye and hang up the call. Always end calls "
-          "you started. If the person talks over the goodbye or right after it, the call stays "
+          "you started. If the person talks over the goodbye, the call stays "
           "up and the status is in_call with what they said: answer with call_say, then call "
           f"call_end again.\n{STATUSES}")
 async def call_end(call_id: str, ctx: Context, message: str | None = None) -> dict:

@@ -176,7 +176,7 @@ def serve(cfg: Config) -> None:
         mgr = CallManager(tel, tts_, stt_, cfg)
 
         def warm() -> None:
-            for comp in (tts_, stt_):
+            for comp in (tts_, stt_, mgr):          # mgr: spoken fillers, made with the TTS
                 try:
                     comp.warmup()
                 except Exception:
